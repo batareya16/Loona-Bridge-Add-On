@@ -1,9 +1,22 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration
-ARG BUILD_FROM=node:20-bookworm-slim
+# Supervisor often builds add-ons on an Alpine-based BUILD_FROM (/bin/ash) — apt-get is missing there (exit 127).
+ARG BUILD_FROM=node:20-alpine
 FROM ${BUILD_FROM}
 
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+RUN set -eux; \
+    if command -v apk >/dev/null 2>&1; then \
+      apk add --no-cache \
+        chromium \
+        nss \
+        freetype \
+        harfbuzz \
+        ca-certificates \
+        ttf-freefont \
+        jq \
+        dumb-init; \
+    elif command -v apt-get >/dev/null 2>&1; then \
+      apt-get update; \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         chromium \
         dumb-init \
         jq \
@@ -29,8 +42,11 @@ RUN apt-get update \
         libxfixes3 \
         libxkbcommon0 \
         libxrandr2 \
-        libxshmfence1 \
-    && rm -rf /var/lib/apt/lists/*
+        libxshmfence1; \
+      rm -rf /var/lib/apt/lists/*; \
+    else \
+      echo "Neither apk nor apt-get found — unsupported BUILD_FROM"; exit 1; \
+    fi
 
 WORKDIR /opt/loona-bridge
 
@@ -43,9 +59,8 @@ RUN npm install --omit=dev \
 
 COPY bridge/ ./
 
-ENV NODE_ENV=production \
-    CHROME_PATH=/usr/bin/chromium \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+# Paths differ: Debian /usr/bin/chromium, Alpine often chromium-browser symlink
+ENV NODE_ENV=production
 
 COPY run.sh /run.sh
 RUN chmod +x /run.sh

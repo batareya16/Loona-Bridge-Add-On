@@ -1,4 +1,5 @@
 ---
+# Alpine совпадает с типичным базовым образом Supervisor → apk в Dockerfile отработает.
 build_from:
-  aarch64: node:20-bookworm-slim
-  amd64: node:20-bookworm-slim
+  aarch64: node:20-alpine
+  amd64: node:20-alpine

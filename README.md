@@ -1,6 +1,6 @@
 # Loona Bridge — аддон для Home Assistant
 
-Docker-аддон запускает ваш существующий **Node + Puppeteer + `bridge.js`**, подключается по WebSocket к Home Assistant Core и забирает кадры Agora. Образ основан на Debian и ставит системный **Chromium** (при необходимости смените браузер через опцию `chrome_path`, если нужен H.264).
+Docker-аддон запускает ваш существующий **Node + Puppeteer + `bridge.js`**, подключается по WebSocket к Home Assistant Core и забирает кадры Agora. Сборка по умолчанию: **Node Alpine + Chromium через `apk`** (Supervisor часто подставляет Alpine; в Dockerfile есть запасной путь с **`apt-get`** для Debian-образов). При необходимости укажите **`chrome_path`**, если нужен другой браузер с H.264.
 
 Состав репозитория:
 
