@@ -1,52 +1,17 @@
-# https://developers.home-assistant.io/docs/add-ons/configuration
-# Supervisor often builds add-ons on an Alpine-based BUILD_FROM (/bin/ash) — apt-get is missing there (exit 127).
+# Loona Bridge — только Alpine/apk. Supervisor собирает с /bin/ash; apt-get в Alpine нет (exit 127).
+# Если в логе сборки всё ещё фигурирует apt-get — на HA подтягивается старый Dockerfile (не тот git commit / не запушено).
 ARG BUILD_FROM=node:20-alpine
 FROM ${BUILD_FROM}
 
-RUN set -eux; \
-    if command -v apk >/dev/null 2>&1; then \
-      apk add --no-cache \
-        chromium \
-        nss \
-        freetype \
-        harfbuzz \
-        ca-certificates \
-        ttf-freefont \
-        jq \
-        dumb-init; \
-    elif command -v apt-get >/dev/null 2>&1; then \
-      apt-get update; \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        chromium \
-        dumb-init \
-        jq \
-        ca-certificates \
-        fonts-liberation \
-        libasound2 \
-        libatk-bridge2.0-0 \
-        libatk1.0-0 \
-        libcairo2 \
-        libcups2 \
-        libdbus-1-3 \
-        libdrm2 \
-        libgbm1 \
-        libglib2.0-0 \
-        libnspr4 \
-        libnss3 \
-        libpango-1.0-0 \
-        libx11-6 \
-        libxcb1 \
-        libxcomposite1 \
-        libxdamage1 \
-        libxext6 \
-        libxfixes3 \
-        libxkbcommon0 \
-        libxrandr2 \
-        libxshmfence1; \
-      rm -rf /var/lib/apt/lists/*; \
-    else \
-      echo "Neither apk nor apt-get found — unsupported BUILD_FROM"; exit 1; \
-    fi
+RUN apk add --no-cache \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont \
+    jq \
+    dumb-init
 
 WORKDIR /opt/loona-bridge
 
@@ -59,7 +24,6 @@ RUN npm install --omit=dev \
 
 COPY bridge/ ./
 
-# Paths differ: Debian /usr/bin/chromium, Alpine often chromium-browser symlink
 ENV NODE_ENV=production
 
 COPY run.sh /run.sh
