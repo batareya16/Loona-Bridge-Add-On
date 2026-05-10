@@ -1,5 +1,5 @@
 ---
-# Alpine совпадает с типичным базовым образом Supervisor → apk в Dockerfile отработает.
+# Явный минимальный Alpine — даже если Supervisor подменит образ, в Dockerfile всё ставится через apk.
 build_from:
-  aarch64: node:20-alpine
-  amd64: node:20-alpine
+  aarch64: alpine:3.21
+  amd64: alpine:3.21

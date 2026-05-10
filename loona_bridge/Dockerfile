@@ -1,9 +1,11 @@
-# Loona Bridge — только Alpine/apk. Supervisor собирает с /bin/ash; apt-get в Alpine нет (exit 127).
-# Если в логе сборки всё ещё фигурирует apt-get — на HA подтягивается старый Dockerfile (не тот git commit / не запушено).
-ARG BUILD_FROM=node:20-alpine
+# Supervisor подставляет свой BUILD_FROM — часто это минимальный Alpine без Node.
+# Поэтому Node и npm ставим только через apk, база — чистый alpine (совпадает с ash-сборкой).
+ARG BUILD_FROM=alpine:3.21
 FROM ${BUILD_FROM}
 
 RUN apk add --no-cache \
+    nodejs \
+    npm \
     chromium \
     nss \
     freetype \
