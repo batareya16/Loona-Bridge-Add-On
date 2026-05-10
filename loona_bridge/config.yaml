@@ -1,0 +1,25 @@
+---
+name: Loona Agora Bridge
+version: "0.1.1"
+slug: loona_bridge
+description: >
+  Запускает Node bridge.js с Puppeteer и системным браузером (H.264) для видео Loona.
+  Читает /config/.loona/bridge-config.json из Home Assistant и подключается по WebSocket к Core.
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: manual_only
+init: false
+map:
+  - type: homeassistant_config
+    read_only: true
+    path: /ha_config
+options:
+  chrome_path: ""
+  fps: 10
+  jpeg_quality: 0.65
+schema:
+  chrome_path: str?
+  fps: int(5,30)?
+  jpeg_quality: float(0.35,0.95)?

@@ -1,0 +1,3 @@
+*.md
+.git
+bridge/start-bridge-mac.sh

@@ -1,0 +1,5 @@
+---
+# Supervisor сканирует подпапки с файлом config.yaml (slug = имя каталога).
+name: Loona Bridge Add-ons
+url: https://github.com/
+maintainer: Loona integration

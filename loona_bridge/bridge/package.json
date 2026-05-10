@@ -1,0 +1,14 @@
+{
+  "name": "loona-agora-bridge",
+  "version": "0.2.0",
+  "description": "Headless Chromium bridge: subscribes to Loona Agora video channel and pipes JPEG frames over WebSocket.",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.15.0",
+    "agora-rtc-sdk-ng": "^4.21.0",
+    "agora-rtm-sdk": "^1.5.1"
+  }
+}

@@ -1,0 +1,504 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Loona Agora Bridge</title>
+  <!-- SDKs: when running via puppeteer, bridge.js injects them via addScriptTag.
+       When running in manual mode (HTTP server on localhost), the SDKs are
+       served from /sdk/rtc.js and /sdk/rtm.js by the Python HTTP server.
+       The script-tag check below makes both paths work. -->
+  <script>
+    // If we have a config in the URL hash, we're in manual mode and need to
+    // load the SDKs ourselves before startAgora can be called.
+    if (location.hash && location.hash.startsWith('#cfg=')) {
+      // Note: scripts loaded synchronously via document.write so they finish
+      // before the inline <script> below runs.
+      document.write('<script src="/sdk/rtc.js"><\/script>');
+      document.write('<script src="/sdk/rtm.js"><\/script>');
+    }
+  </script>
+  <script>
+    // ── SDP patch: inject sps-pps-idr-in-keyframe=1 ─────────────────────────
+    // Loona robot advertises {profile-level-id:42001f; sps-pps-idr-in-keyframe:1}
+    // in its SDP. Open-source Chromium answers WITHOUT this param, so the robot
+    // does NOT embed SPS+PPS NAL units in IDR frames → decoder never initialises
+    // → video plays briefly then stalls ("playing → waiting", raw.decoded=0).
+    // Patching RTCPeerConnection.setLocalDescription to re-add the param forces
+    // the robot to include SPS/PPS in every keyframe, fixing decode failures
+    // after PLI/NACK-triggered keyframe re-requests.
+    (function patchRtcSdpForH264() {
+      // The robot's SDP has PT 100 defined in two m-sections within the same
+      // BUNDLE group — one with sps-pps-idr-in-keyframe:1 and one without.
+      // Chromium validates that the same PT must have IDENTICAL parameters
+      // across all BUNDLE m-sections and throws INVALID_PARAMETER, which
+      // kills DTLS → no SRTP → raw.bytes=0.
+      //
+      // Fix: normalise ALL H.264 fmtp lines in BOTH local and remote descriptions
+      // so every occurrence of PT 100 gets sps-pps-idr-in-keyframe=1. Consistent
+      // params across the whole BUNDLE → no collision → DTLS/SRTP/RTP work.
+      function injectSpsParam(sdpStr) {
+        // Match any fmtp line that contains profile-level-id (identifies H.264).
+        // profile-level-id can be anywhere in the param string, e.g.:
+        //   a=fmtp:100 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f
+        return sdpStr.replace(
+          /^(a=fmtp:(\d+) [^\r\n]*profile-level-id=[0-9a-fA-F]+[^\r\n]*)$/mg,
+          (line, _, pt) => {
+            if (!line.includes('sps-pps-idr-in-keyframe')) {
+              console.log('[sdp-patch] PT=' + pt + ' +sps-pps-idr-in-keyframe=1');
+              return line + ';sps-pps-idr-in-keyframe=1';
+            }
+            return line;
+          }
+        );
+      }
+      function wrap(proto, method) {
+        const orig = proto[method];
+        proto[method] = function(init) {
+          if (init && init.sdp) {
+            const patched = injectSpsParam(init.sdp);
+            if (patched !== init.sdp) {
+              return orig.call(this, { type: init.type, sdp: patched });
+            }
+          }
+          return orig.apply(this, arguments);
+        };
+      }
+      wrap(RTCPeerConnection.prototype, 'setLocalDescription');
+      wrap(RTCPeerConnection.prototype, 'setRemoteDescription');
+      console.log('[sdp-patch] setLocal+setRemoteDescription patched for H.264 BUNDLE consistency');
+    })();
+  </script>
+  <style>
+    body { margin: 0; background: #111; color: #ccc; font: 12px monospace; }
+    #remote-container { width: 640px; height: 360px; background: #000;
+                        display: flex; align-items: center; justify-content: center; }
+    #remote-container video { width: 100% !important; height: 100% !important;
+                              object-fit: contain !important; }
+    #remote { display: none; }   /* fallback, only used if Agora .play() fails */
+    #grab   { display: none; }
+    #log    { padding: 4px; max-height: 60vh; overflow: auto;
+              white-space: pre-wrap; word-break: break-all; font-size: 11px;
+              border: 1px solid #333; }
+  </style>
+  <script>
+    // ── RTCPeerConnection patch: enable Insertable Streams API ───────────────
+    // Chrome 94+ supports RTCRtpReceiver.createEncodedStreams() which lets us
+    // intercept raw H.264 NAL-unit data BEFORE the browser's codec pipeline.
+    // Broadway.js then decodes in pure JS — no native H.264 support needed.
+    //
+    // The flag must be in the RTCPeerConnection constructor config.  Agora SDK
+    // creates the PC internally, so we patch the constructor before SDK load.
+    (function patchRTCForInsertableStreams() {
+      if (typeof RTCPeerConnection === 'undefined') return;
+      const Orig = window.RTCPeerConnection;
+      function RTCPeerConnectionPatched(config) {
+        // Return a native RTCPeerConnection with encodedInsertableStreams added.
+        return new Orig({...(config || {}), encodedInsertableStreams: true});
+      }
+      // Make instanceof + prototype chain work correctly.
+      RTCPeerConnectionPatched.prototype = Orig.prototype;
+      Object.setPrototypeOf(RTCPeerConnectionPatched, Orig);
+      try { Object.defineProperty(RTCPeerConnectionPatched, 'name',
+              {value: 'RTCPeerConnection'}); } catch (_) {}
+      window.RTCPeerConnection = RTCPeerConnectionPatched;
+
+      // Also patch setConfiguration: Agora SDK calls it to update ICE servers.
+      // If the new config omits encodedInsertableStreams Chrome throws
+      // "unsupported modification" because the flag can't be toggled after
+      // construction.  Always keep it true.
+      const origSetCfg = Orig.prototype.setConfiguration;
+      if (origSetCfg) {
+        Orig.prototype.setConfiguration = function(config) {
+          return origSetCfg.call(this, {...(config || {}), encodedInsertableStreams: true});
+        };
+      }
+
+      console.log('[pc-patch] RTCPeerConnection + setConfiguration patched: encodedInsertableStreams=true');
+    })();
+  </script>
+</head>
+<body>
+  <div id="remote-container"></div>
+  <video id="remote" autoplay muted playsinline></video>
+  <canvas id="grab"></canvas>
+  <pre id="log"></pre>
+  <script>
+    const log = (m) => {
+      const p = document.getElementById('log');
+      // Append (much larger ring buffer than before so nothing useful gets cut)
+      p.textContent = (p.textContent + '\n' + m).slice(-20000);
+      // Auto-scroll to bottom
+      p.scrollTop = p.scrollHeight;
+      console.log(m);
+    };
+
+    /** Build the standard Loona binary packet:
+     *    [LENGTH:int32 LE = 4+body.length] [COMMAND:int32 LE] [BODY:bytes]
+     *  LENGTH includes the 4-byte COMMAND field (matches Android SendDataBean.parse()).
+     *  Returns a Uint8Array.
+     */
+    const makePacket = (command, body /* Uint8Array | undefined */) => {
+      body = body || new Uint8Array(0);
+      const buf = new Uint8Array(8 + body.length);
+      const view = new DataView(buf.buffer);
+      view.setInt32(0, 4 + body.length, true); // LE length of (command + body)
+      view.setInt32(4, command,         true); // LE command code
+      buf.set(body, 8);
+      return buf;
+    };
+    const int32LE = (n) => {
+      const u = new Uint8Array(4);
+      new DataView(u.buffer).setInt32(0, n, true);
+      return u;
+    };
+    const concat = (...arrs) => {
+      const total = arrs.reduce((a, b) => a + b.length, 0);
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const a of arrs) { out.set(a, off); off += a.length; }
+      return out;
+    };
+
+    /** Called from puppeteer after the page loads. */
+    window.startAgora = async (cfg) => {
+      log('config: ' + JSON.stringify({...cfg, token: cfg.token?.slice(0, 12) + '...',
+                                            rtm_token: cfg.rtm_token?.slice(0, 12) + '...'}));
+
+      // 1) Open WS to the Python receiver — bridge.js sets cfg.ws_port.
+      // ws_host defaults to 127.0.0.1 (subprocess mode inside HA container) but
+      // is overridden to the HA Core IP when running from the Terminal add-on.
+      const wsHost = cfg.ws_host || '127.0.0.1';
+      const wsUrl  = 'ws://' + wsHost + ':' + cfg.ws_port;
+
+      // Use a mutable binding so tick() / stateInterval always see the live socket.
+      // Auto-reconnect: if Python tears down and restarts the WS server (e.g. after
+      // the manual-mode detection window), the bridge page re-attaches automatically.
+      let ws;
+      let _wsResolve;
+      const wsFirstOpen = new Promise((res) => { _wsResolve = res; });
+      function openWs() {
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen  = () => { log('ws open'); if (_wsResolve) { _wsResolve(); _wsResolve = null; } };
+        ws.onerror = () => log('ws error');
+        ws.onclose = () => {
+          log('ws closed — retry in 3 s');
+          setTimeout(openWs, 3000);
+        };
+      }
+      openWs();
+      await wsFirstOpen;
+
+      // 1b) If bridge.py gave us a stub config (empty app_id), block here until
+      //     Python sends {"type":"agora_config", ...} with real Agora credentials.
+      //     This happens when the WS server starts before wake_robot() completes.
+      if (!cfg.app_id) {
+        log('stub config — waiting for Agora credentials from Python...');
+        cfg = await new Promise((resolve) => {
+          const onCfg = (ev) => {
+            if (typeof ev.data !== 'string') return;
+            try {
+              const m = JSON.parse(ev.data);
+              if (m && m.type === 'agora_config') {
+                ws.removeEventListener('message', onCfg);
+                resolve({...cfg, ...m});
+              }
+            } catch(e) {}
+          };
+          ws.addEventListener('message', onCfg);
+        });
+        log('Agora credentials received: channel=' + cfg.channel.slice(0,16));
+      }
+
+      // 2) Join the Agora RTC channel.
+      // Match the robot's Android Agora SDK config: mode='live' + role='host'.
+      // When clients in the same channel use different `mode` settings, Agora
+      // silently breaks data delivery (control plane works, but no RTP bytes
+      // arrive — receiveBitrate stays 0 forever). Robot is broadcaster in live
+      // mode, so we go live+host too.
+      const rtcMode  = cfg.rtc_mode || 'live';
+      const rtcRole  = cfg.role     || 'host';
+      const rtcCodec = cfg.codec    || 'h264';
+      log('RTC config: mode=' + rtcMode + ' role=' + rtcRole + ' codec=' + rtcCodec);
+      const rtcClient = AgoraRTC.createClient({mode: rtcMode, codec: rtcCodec, role: rtcRole});
+
+      // Guard: Broadway pipeline is set up only once per video session.
+      // The keyframe-forcer may trigger resubscribe → user-published fires again;
+      // we must NOT create a second Decoder or open a second encoded stream.
+      let broadwayActive = false;
+
+      rtcClient.on('user-published', async (user, mediaType) => {
+        log('user-published uid=' + user.uid + ' kind=' + mediaType);
+        // Subscribe to BOTH audio and video — some Agora server-side QoS
+        // refuses to keep delivering video bytes to a viewer that hasn't
+        // acknowledged the audio track. Robot publishes both, so we ack both.
+        await rtcClient.subscribe(user, mediaType);
+        log('subscribed to uid=' + user.uid + ' kind=' + mediaType);
+        if (mediaType === 'audio') {
+          if (user.audioTrack) {
+            try { user.audioTrack.setVolume(0); } catch (e) {}
+          }
+          return;
+        }
+        if (mediaType !== 'video') return;
+        if (broadwayActive) {
+          log('[Broadway] already running — resubscribe complete, new IDR expected');
+          return;
+        }
+        broadwayActive = true;
+
+        const remoteTrack = user.videoTrack;
+
+        // ── Canvas capture from native H.264 decode ───────────────────────────
+        // Chrome-for-Testing / Chromium (open-source) has NO H.264 at any level:
+        // framesRx=0 confirmed — the RTP depacketizer itself is absent.
+        // Broadway + Insertable Streams cannot work because there are no frames
+        // to intercept.
+        //
+        // This approach requires a browser WITH H.264:
+        //   Linux ARM64: Google Chrome ≥116, Brave, or Microsoft Edge.
+        //   Install: apt-get install google-chrome-stable  (or brave-browser)
+        //   bridge.js already checks /usr/bin/google-chrome automatically.
+        //
+        // Flow: Agora decodes H.264 → renders to <video> element →
+        //        canvas.drawImage(videoEl) at FPS → JPEG → WebSocket.
+
+        const FPS        = cfg.fps || 15;
+        const QUALITY    = cfg.jpeg_quality || 0.7;
+        const minInterval = 1000 / FPS;
+        const grabCanvas = document.getElementById('grab');
+        const grabCtx    = grabCanvas.getContext('2d');
+        let capturedFrames = 0;
+        let firstFrameLogged = false;
+        let lastSendTs = 0;
+
+        // Let Agora render into our container div.
+        const container = document.getElementById('remote-container');
+        try {
+          await remoteTrack.play(container);
+          log('[video] remoteTrack.play() OK');
+        } catch (e) {
+          log('[video] remoteTrack.play() error: ' + e.message);
+        }
+
+        // Wait up to 10 s for Agora's internal <video> to have decoded dimensions.
+        // No dimensions = no H.264 decoder in this browser.
+        let videoEl = null;
+        for (let i = 0; i < 100; i++) {
+          await new Promise(r => setTimeout(r, 100));
+          const v = container.querySelector('video');
+          if (v && v.videoWidth > 0 && v.videoHeight > 0) { videoEl = v; break; }
+        }
+        if (videoEl) {
+          log('[video] <video> ready: ' + videoEl.videoWidth + 'x' + videoEl.videoHeight);
+        } else {
+          log('[video] WARN: no decoded video after 10 s');
+          log('[video] FIX: browser lacks H.264 — install Google Chrome for Linux ARM64:');
+          log('[video]   apt-get install -y wget && \\');
+          log('[video]   wget https://dl.google.com/linux/direct/google-chrome-stable_current_arm64.deb && \\');
+          log('[video]   dpkg -i google-chrome-stable_current_arm64.deb || apt-get install -f -y');
+          log('[video] Retrying canvas capture — will log FIRST CAPTURE when video appears.');
+        }
+
+        // Periodic stats — use Agora's track stats (no PC digging needed).
+        let statsCount = 0;
+        setInterval(async () => {
+          statsCount++;
+          let raw = {};
+          try {
+            // Find the PC lazily for stats (no Insertable Streams usage).
+            const isPC = (o) => o && typeof o === 'object' &&
+              typeof o.getStats === 'function' && typeof o.getReceivers === 'function';
+            const findPC = (obj, d) => {
+              if (d > 7 || !obj || typeof obj !== 'object') return null;
+              if (isPC(obj)) return obj;
+              try { for (const k of Object.keys(obj)) {
+                try { const v = obj[k];
+                  if (v && typeof v === 'object' && !Array.isArray(v)) {
+                    const r = findPC(v, d + 1); if (r) return r; }
+                } catch (_) {}
+              }} catch (_) {}
+              return null;
+            };
+            const pc = findPC(rtcClient, 0);
+            if (pc) {
+              const report = await pc.getStats();
+              let codecs = [];
+              report.forEach((r) => {
+                if (r.type === 'inbound-rtp' && r.kind === 'video')
+                  raw = {bytes: r.bytesReceived, pkts: r.packetsReceived,
+                         framesRx: r.framesReceived, framesDec: r.framesDecoded,
+                         kf: r.keyFramesDecoded};
+                if (r.type === 'codec' && statsCount === 1)
+                  codecs.push(r.mimeType + '/pt=' + r.payloadType);
+              });
+              if (statsCount === 1 && codecs.length)
+                log('[stats] codecs: ' + codecs.join(', '));
+            }
+          } catch (_) {}
+          log('[video] captured=' + capturedFrames +
+              ' raw.bytes='  + (raw.bytes    || 0) +
+              ' framesRx='   + (raw.framesRx  != null ? raw.framesRx  : '?') +
+              ' framesDec='  + (raw.framesDec != null ? raw.framesDec : '?') +
+              ' raw.kf='     + (raw.kf || 0));
+        }, 5000);
+
+        // Canvas capture loop.
+        const tick = () => {
+          // Re-query in case Agora replaced the element.
+          if (!videoEl || videoEl.videoWidth === 0)
+            videoEl = container.querySelector('video') || null;
+
+          if (videoEl && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
+            const w = videoEl.videoWidth, h = videoEl.videoHeight;
+            if (grabCanvas.width  !== w) grabCanvas.width  = w;
+            if (grabCanvas.height !== h) grabCanvas.height = h;
+            grabCtx.drawImage(videoEl, 0, 0);
+            capturedFrames++;
+            if (!firstFrameLogged) {
+              firstFrameLogged = true;
+              log('[video] FIRST CAPTURE — ' + w + 'x' + h);
+            }
+            if (ws.readyState === 1) {
+              const now = Date.now();
+              if (now - lastSendTs >= minInterval) {
+                lastSendTs = now;
+                grabCanvas.toBlob((blob) => {
+                  if (!blob) return;
+                  blob.arrayBuffer().then((buf) => {
+                    if (ws.readyState === 1) ws.send(buf);
+                  });
+                }, 'image/jpeg', QUALITY);
+              }
+            }
+          }
+          setTimeout(tick, minInterval);
+        };
+        tick();
+        log('[video] canvas capture loop started');
+      });
+
+      rtcClient.on('user-unpublished', (user, mediaType) => {
+        log('user-unpublished uid=' + user.uid + ' kind=' + mediaType);
+      });
+      rtcClient.on('user-joined',  (user) => log('user-joined  uid=' + user.uid));
+      rtcClient.on('user-left',    (user, reason) => log('user-left    uid=' + user.uid + ' reason=' + reason));
+
+      const rtcUid = await rtcClient.join(
+        cfg.app_id, cfg.channel, cfg.token,
+        cfg.user_id ? parseInt(cfg.user_id, 10) : null
+      );
+      log('RTC joined channel=' + cfg.channel + ' as uid=' + rtcUid);
+
+      // 3) Login to Agora RTM and send the trigger packet to the robot.
+      //
+      // Without this, the robot stays silent in the channel — it waits for the
+      // app to "say hello" via RTM peer message. The production app sends
+      // CMD_CONTROL=100900 with subcmd=500 ("ask version") on kvsLoadSuccess
+      // (ControlRemoteNewActivity.kvsLoadSuccess → sendAskVersionCommand →
+      //  CommDataFactory.sendControlCommandRemote(500, ...)).  Sending the same
+      // packet from here also makes the robot start publishing.
+      if (!cfg.rtm_token || !cfg.rtm_uid_app || !cfg.rtm_uid_loona) {
+        log('[!] RTM credentials missing — robot likely will not publish');
+      } else {
+        const rtmClient = AgoraRTM.createInstance(cfg.app_id);
+        rtmClient.on('ConnectionStateChanged', (state, reason) =>
+          log('RTM state=' + state + ' reason=' + reason));
+
+        // Capture every peer message the robot sends back. Each Loona RTM packet
+        // is the standard binary format [LENGTH:int32 LE][CMD:int32 LE][BODY].
+        const hexdump = (u8) => {
+          let h = '';
+          for (let i = 0; i < u8.length; i++) {
+            h += u8[i].toString(16).padStart(2, '0') + (i < u8.length - 1 ? ' ' : '');
+            if (i > 64) { h += '...'; break; }
+          }
+          return h;
+        };
+        rtmClient.on('MessageFromPeer', (msg, peerId) => {
+          const raw = msg && msg.rawMessage;
+          if (raw) {
+            // Decode header; rawMessage may be Uint8Array or ArrayBuffer.
+            const u8 = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+            let cmd = -1, len = -1;
+            if (u8.length >= 8) {
+              const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+              len = dv.getInt32(0, true);
+              cmd = dv.getInt32(4, true);
+            }
+            log('RTM<-peer ' + peerId.slice(0,12) + '... cmd=' + cmd +
+                ' len=' + len + ' bytes=' + u8.length + ' [' + hexdump(u8) + ']');
+            // Forward to Python as text frame (JSON envelope) so we don't confuse
+            // it with JPEG binary frames.
+            if (ws.readyState === 1) {
+              try {
+                const arr = Array.from(u8);
+                ws.send(JSON.stringify({type: 'rtm', peer: peerId, cmd, len, bytes: arr}));
+              } catch (e) {}
+            }
+          } else {
+            log('RTM<-peer ' + peerId.slice(0,12) + '... text=' + msg.text);
+          }
+        });
+
+        try {
+          await rtmClient.login({uid: cfg.rtm_uid_app, token: cfg.rtm_token});
+          log('RTM logged in as ' + cfg.rtm_uid_app);
+        } catch (e) {
+          log('[!] RTM login failed: ' + (e && (e.message || JSON.stringify(e))));
+          throw e;
+        }
+
+        // Build the askVersion packet: cmd=100900, body = int32(500).
+        const CMD_CONTROL  = 100900;
+        const SUBCMD_ASKVER = 500;
+        const askVer = makePacket(CMD_CONTROL, int32LE(SUBCMD_ASKVER));
+        log('sending RTM askVersion (' + askVer.length + ' bytes) to ' + cfg.rtm_uid_loona);
+        try {
+          await rtmClient.sendMessageToPeer(
+            { rawMessage: askVer, description: 'askVersion' },
+            cfg.rtm_uid_loona
+          );
+          log('RTM askVersion sent OK');
+        } catch (e) {
+          log('[!] RTM sendMessageToPeer failed: ' + (e && (e.message || JSON.stringify(e))));
+        }
+
+        // Stash for later (Python may want to send commands too via window.rtmSend()).
+        window.rtmSend = async (cmdCode, bodyBytes) => {
+          const pkt = makePacket(cmdCode, bodyBytes);
+          await rtmClient.sendMessageToPeer({ rawMessage: pkt }, cfg.rtm_uid_loona);
+        };
+      }
+
+      // Keep alive forever; puppeteer closes the page on bridge.js exit.
+      return rtcUid;
+    };
+
+    // Manual-mode auto-start: if URL has #cfg=BASE64(JSON), parse and run.
+    if (location.hash && location.hash.startsWith('#cfg=')) {
+      try {
+        const cfgJson = atob(decodeURIComponent(location.hash.slice('#cfg='.length)));
+        const cfg     = JSON.parse(cfgJson);
+        // Wait for SDKs (loaded by document.write above) to be ready.
+        const waitSdks = () => new Promise((resolve, reject) => {
+          let tries = 0;
+          const t = setInterval(() => {
+            if (typeof AgoraRTC !== 'undefined' && typeof AgoraRTM !== 'undefined') {
+              clearInterval(t); resolve();
+            } else if (++tries > 40) {
+              clearInterval(t); reject(new Error('SDKs did not load in time'));
+            }
+          }, 100);
+        });
+        waitSdks()
+          .then(() => window.startAgora(cfg))
+          .catch(err => log('[!] manual-start error: ' + err.message));
+      } catch (e) {
+        document.body.insertAdjacentHTML('beforeend',
+          '<pre style="color:#f55">cfg parse error: ' + e.message + '</pre>');
+      }
+    }
+  </script>
+</body>
+</html>
