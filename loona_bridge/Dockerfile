@@ -1,8 +1,5 @@
-# Debian: Chromium из репозитория часто без H.264 в WebRTC. Дополнительно ставим Google Chrome
-# из официального .deb (arm64/amd64), если файл доступен — у run.sh приоритет google-chrome-stable.
-#
-# Сборка должна идти на Debian-слое (есть apt-get). Если Supervisor подставит только Alpine без apt —
-# используйте образ с debian в build.yaml или предсобранный image из реестра.
+# Debian experiment: test Chromium + chromium-codecs-ffmpeg-extra on ARM64.
+# This is a targeted attempt to improve H.264 decode without Chrome/Brave packaging.
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
@@ -14,6 +11,7 @@ RUN apt-get update \
         dumb-init \
         jq \
         chromium \
+        chromium-codecs-ffmpeg-extra \
         nodejs \
         npm \
         fonts-liberation \
@@ -39,23 +37,6 @@ RUN apt-get update \
         libxrandr2 \
         libxshmfence1 \
     && rm -rf /var/lib/apt/lists/*
-
-# Try installing Brave browser (Chromium-based) for H.264 test.
-# If repo/package is unavailable on current arch, keep image buildable and fall back to other browsers.
-RUN set -eux; \
-    ARCH="$(dpkg --print-architecture)"; \
-    install -m 0755 -d /etc/apt/keyrings; \
-    curl -fsSL https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg \
-      -o /etc/apt/keyrings/brave-browser-archive-keyring.gpg; \
-    echo "deb [signed-by=/etc/apt/keyrings/brave-browser-archive-keyring.gpg arch=${ARCH}] https://brave-browser-apt-release.s3.brave.com/ stable main" \
-      > /etc/apt/sources.list.d/brave-browser-release.list; \
-    apt-get update; \
-    if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends brave-browser; then \
-      brave-browser --version || true; \
-    else \
-      echo "[loona-bridge build] brave-browser package is unavailable for arch=${ARCH}; continuing without it"; \
-    fi; \
-    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/loona-bridge
 

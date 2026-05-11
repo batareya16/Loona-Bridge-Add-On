@@ -32,19 +32,14 @@ pick_browser() {
     log "ERROR: chrome_path is set but not executable: $custom"
     return 1
   fi
-  # Priority: Brave -> Google Chrome -> Chromium fallback.
-  for c in /usr/bin/brave-browser \
-           /usr/bin/google-chrome-stable /usr/bin/google-chrome \
-           /usr/bin/chromium /usr/bin/chromium-browser; do
+  # Debian ffmpeg-extra experiment: prefer Chromium binary directly.
+  for c in /usr/bin/chromium /usr/bin/chromium-browser; do
     if [[ -x "$c" ]]; then
-      if [[ "$c" == *chromium* ]]; then
-        log "WARN: falling back to Chromium ($c). H.264 decode may fail for Loona stream."
-      fi
       echo "$c"
       return 0
     fi
   done
-  log "ERROR: no browser binary found. Set chrome_path in add-on options."
+  log "ERROR: Chromium binary not found. Set chrome_path in add-on options."
   return 1
 }
 
