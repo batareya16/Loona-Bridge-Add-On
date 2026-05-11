@@ -177,14 +177,14 @@ function findSdkFile(pkgName, candidates) {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-gpu',
       '--no-zygote',
       '--disable-seccomp-filter-sandbox',
       '--disable-namespace-sandbox',
       '--disable-crash-reporter',
       '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
-      '--disable-features=IsolateOrigins,site-per-process',
+      '--enable-features=NetworkService,NetworkServiceInProcess',
+      '--disable-features=IsolateOrigins,site-per-process,VizDisplayCompositor,WebRtcHideLocalIpsWithMdns',
     ],
   });
 

@@ -38,20 +38,30 @@ RUN apt-get update \
 
 RUN set -eux; \
     ARCH="$(dpkg --print-architecture)"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl gnupg ca-certificates; \
+    \
     if [ "$ARCH" = "arm64" ]; then \
-      install -m 0755 -d /usr/share/keyrings; \
-      curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key \
-        | gpg --dearmor -o /usr/share/keyrings/raspberrypi.gpg; \
-      echo "deb [signed-by=/usr/share/keyrings/raspberrypi.gpg] https://archive.raspberrypi.com/debian/ bookworm main" \
-        > /etc/apt/sources.list.d/raspi.list; \
+      # 1. СКАЧИВАЕМ КЛЮЧ (правильный путь)
+      curl -fsSL https://raspberrypi.org | gpg --dearmor -o /usr/share/keyrings/raspberrypi-archive-keyring.gpg; \
+      \
+      # 2. ДОБАВЛЯЕМ РЕПОЗИТОРИЙ (обязательно archive... и bookworm)
+      echo "deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.gpg] http://raspberrypi.org bookworm main" > /etc/apt/sources.list.d/raspi.list; \
+      \
       apt-get update; \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        chromium-browser chromium-codecs-ffmpeg-extra; \
-      chromium-browser --version || true; \
+      \
+      # 3. УСТАНОВКА (в Bookworm пакет называется просто chromium, но из этого репо он с патчами)
+      apt-get install -y --no-install-recommends \
+        chromium \
+        chromium-common \
+        libavcodec-extra \
+        libexif12 \
+        libgl1-mesa-dri; \
+        \
+      # Создаем симлинк, чтобы Puppeteer всегда находил путь chromium-browser
+      ln -s /usr/bin/chromium /usr/bin/chromium-browser; \
     else \
-      apt-get update; \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium; \
-      chromium --version || true; \
+      apt-get install -y --no-install-recommends chromium; \
     fi; \
     rm -rf /var/lib/apt/lists/*
 
@@ -59,7 +69,8 @@ WORKDIR /opt/loona-bridge
 
 COPY bridge/package.json ./
 ENV PUPPETEER_SKIP_DOWNLOAD=true \
-    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1
+    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 RUN npm install --omit=dev \
     && npm cache clean --force
