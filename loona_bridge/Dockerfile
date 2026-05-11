@@ -3,7 +3,7 @@
 #
 # Сборка должна идти на Debian-слое (есть apt-get). Если Supervisor подставит только Alpine без apt —
 # используйте образ с debian в build.yaml или предсобранный image из реестра.
-ARG BUILD_FROM=debian:bookworm-slim
+ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
 RUN apt-get update \

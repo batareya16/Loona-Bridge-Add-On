@@ -1,4 +1,5 @@
 ---
 build_from:
-  aarch64: debian:bookworm-slim
-  amd64: debian:bookworm-slim
+  # Use Home Assistant Debian base images (Supervisor may otherwise ignore plain debian: tags)
+  aarch64: ghcr.io/home-assistant/aarch64-base-debian:bookworm
+  amd64: ghcr.io/home-assistant/amd64-base-debian:bookworm
