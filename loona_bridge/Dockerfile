@@ -1,5 +1,4 @@
-# Debian experiment: test Chromium + chromium-codecs-ffmpeg-extra on ARM64.
-# This is a targeted attempt to improve H.264 decode without Chrome/Brave packaging.
+# Raspberry Pi experiment: use RPi Chromium build + codecs on ARM64.
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
@@ -10,7 +9,6 @@ RUN apt-get update \
         wget \
         dumb-init \
         jq \
-        chromium \
         nodejs \
         npm \
         fonts-liberation \
@@ -37,15 +35,23 @@ RUN apt-get update \
         libxshmfence1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Required for this experiment: fail with explicit message if repo/arch has no codec package.
 RUN set -eux; \
-    apt-get update; \
-    if ! apt-cache show chromium-codecs-ffmpeg-extra >/dev/null 2>&1; then \
-      echo "[loona-bridge build] FATAL: package chromium-codecs-ffmpeg-extra is not available for this base image/architecture."; \
-      echo "[loona-bridge build] FATAL: cannot run Debian ffmpeg-extra H.264 experiment."; \
-      exit 42; \
+    ARCH="$(dpkg --print-architecture)"; \
+    if [ "$ARCH" = "arm64" ]; then \
+      install -m 0755 -d /usr/share/keyrings; \
+      curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key \
+        | gpg --dearmor -o /usr/share/keyrings/raspberrypi.gpg; \
+      echo "deb [signed-by=/usr/share/keyrings/raspberrypi.gpg] https://archive.raspberrypi.com/debian/ bookworm main" \
+        > /etc/apt/sources.list.d/raspi.list; \
+      apt-get update; \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        chromium-browser chromium-codecs-ffmpeg-extra; \
+      chromium-browser --version || true; \
+    else \
+      apt-get update; \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium; \
+      chromium --version || true; \
     fi; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium-codecs-ffmpeg-extra; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/loona-bridge

@@ -32,8 +32,8 @@ pick_browser() {
     log "ERROR: chrome_path is set but not executable: $custom"
     return 1
   fi
-  # Debian ffmpeg-extra experiment: prefer Chromium binary directly.
-  for c in /usr/bin/chromium /usr/bin/chromium-browser; do
+  # RPi experiment: prefer chromium-browser from Raspberry Pi repo, then chromium.
+  for c in /usr/bin/chromium-browser /usr/bin/chromium; do
     if [[ -x "$c" ]]; then
       echo "$c"
       return 0
