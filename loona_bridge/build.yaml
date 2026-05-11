@@ -1,5 +1,4 @@
 ---
-# Явный минимальный Alpine — даже если Supervisor подменит образ, в Dockerfile всё ставится через apk.
 build_from:
-  aarch64: alpine:3.21
-  amd64: alpine:3.21
+  aarch64: debian:bookworm-slim
+  amd64: debian:bookworm-slim
