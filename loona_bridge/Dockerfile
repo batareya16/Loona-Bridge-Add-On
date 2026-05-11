@@ -11,7 +11,6 @@ RUN apt-get update \
         dumb-init \
         jq \
         chromium \
-        chromium-codecs-ffmpeg-extra \
         nodejs \
         npm \
         fonts-liberation \
@@ -37,6 +36,17 @@ RUN apt-get update \
         libxrandr2 \
         libxshmfence1 \
     && rm -rf /var/lib/apt/lists/*
+
+# Required for this experiment: fail with explicit message if repo/arch has no codec package.
+RUN set -eux; \
+    apt-get update; \
+    if ! apt-cache show chromium-codecs-ffmpeg-extra >/dev/null 2>&1; then \
+      echo "[loona-bridge build] FATAL: package chromium-codecs-ffmpeg-extra is not available for this base image/architecture."; \
+      echo "[loona-bridge build] FATAL: cannot run Debian ffmpeg-extra H.264 experiment."; \
+      exit 42; \
+    fi; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium-codecs-ffmpeg-extra; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/loona-bridge
 
