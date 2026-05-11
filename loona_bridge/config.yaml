@@ -1,6 +1,6 @@
 ---
 name: Loona Agora Bridge
-version: "0.1.5"
+version: "0.1.7"
 slug: loona_bridge
 description: >
   Запускает Node bridge.js с Puppeteer и системным браузером (H.264) для видео Loona.

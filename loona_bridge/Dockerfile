@@ -40,22 +40,22 @@ RUN apt-get update \
         libxshmfence1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Chrome с проприетарными кодеками (404 / сбой установки → остаётся chromium без H.264 в WebRTC).
-RUN apt-get update \
-    && ARCH="$(dpkg --print-architecture)" \
-    && if [ "$ARCH" = "arm64" ]; then \
-         wget -q -O /tmp/chrome.deb \
-           "https://dl.google.com/linux/direct/google-chrome-stable_current_arm64.deb" \
-           && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /tmp/chrome.deb \
-           || echo "[loona-bridge build] Chrome arm64 не установлен — проверьте URL/deb"; \
-       elif [ "$ARCH" = "amd64" ]; then \
-         wget -q -O /tmp/chrome.deb \
-           "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" \
-           && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /tmp/chrome.deb \
-           || echo "[loona-bridge build] Chrome amd64 не установлен"; \
-       fi \
-    && rm -f /tmp/chrome.deb \
-    && rm -rf /var/lib/apt/lists/*
+# Try installing Brave browser (Chromium-based) for H.264 test.
+# If repo/package is unavailable on current arch, keep image buildable and fall back to other browsers.
+RUN set -eux; \
+    ARCH="$(dpkg --print-architecture)"; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg \
+      -o /etc/apt/keyrings/brave-browser-archive-keyring.gpg; \
+    echo "deb [signed-by=/etc/apt/keyrings/brave-browser-archive-keyring.gpg arch=${ARCH}] https://brave-browser-apt-release.s3.brave.com/ stable main" \
+      > /etc/apt/sources.list.d/brave-browser-release.list; \
+    apt-get update; \
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends brave-browser; then \
+      brave-browser --version || true; \
+    else \
+      echo "[loona-bridge build] brave-browser package is unavailable for arch=${ARCH}; continuing without it"; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/loona-bridge
 

@@ -22,19 +22,29 @@ read_options() {
   echo "$fps|$jpeg|$chrome_opt"
 }
 
-pick_chrome() {
+pick_browser() {
   local custom="$1"
-  if [[ -n "$custom" && -x "$custom" ]]; then
-    echo "$custom"
-    return 0
+  if [[ -n "$custom" ]]; then
+    if [[ -x "$custom" ]]; then
+      echo "$custom"
+      return 0
+    fi
+    log "ERROR: chrome_path is set but not executable: $custom"
+    return 1
   fi
-  for c in /usr/bin/google-chrome-stable /usr/bin/google-chrome \
+  # Priority: Brave -> Google Chrome -> Chromium fallback.
+  for c in /usr/bin/brave-browser \
+           /usr/bin/google-chrome-stable /usr/bin/google-chrome \
            /usr/bin/chromium /usr/bin/chromium-browser; do
     if [[ -x "$c" ]]; then
+      if [[ "$c" == *chromium* ]]; then
+        log "WARN: falling back to Chromium ($c). H.264 decode may fail for Loona stream."
+      fi
       echo "$c"
       return 0
     fi
   done
+  log "ERROR: no browser binary found. Set chrome_path in add-on options."
   return 1
 }
 
@@ -52,8 +62,7 @@ wait_for_ha_config() {
 
 IFS='|' read -r FPS JPEG CHROME_OPT < <(read_options)
 
-if ! CHROME_BIN="$(pick_chrome "$CHROME_OPT")"; then
-  log "ERROR: no executable browser found. Install Chrome/Chromium or set chrome_path in add-on options."
+if ! CHROME_BIN="$(pick_browser "$CHROME_OPT")"; then
   exit 1
 fi
 
@@ -72,7 +81,7 @@ while true; do
   fi
 
   IFS='|' read -r FPS JPEG CHROME_OPT < <(read_options)
-  if CHROME_BIN="$(pick_chrome "$CHROME_OPT")"; then
+  if CHROME_BIN="$(pick_browser "$CHROME_OPT")"; then
     export CHROME_PATH="$CHROME_BIN"
     export PUPPETEER_EXECUTABLE_PATH="$CHROME_BIN"
   fi
