@@ -55,6 +55,19 @@ wait_for_ha_config() {
   done
 }
 
+# ── Runtime diagnostics (visible in HA add-on log) ───────────────────────────
+log "=== CHROMIUM DIAGNOSTIC ==="
+log "arch: $(dpkg --print-architecture 2>/dev/null || uname -m)"
+log "chromium packages: $(dpkg -l 2>/dev/null | grep chromium | awk '{print $2" "$3}' | tr '\n' ' ')"
+log "chromium binary: $(ls -la /usr/bin/chromium* 2>/dev/null | tr '\n' ' ')"
+CHROMIUM_REAL="$(readlink -f /usr/bin/chromium 2>/dev/null || echo 'not found')"
+log "chromium real path: $CHROMIUM_REAL"
+CHROMIUM_DIR="$(dirname "$CHROMIUM_REAL" 2>/dev/null)"
+log "libffmpeg.so search: $(find /usr/lib /usr/local/lib -name libffmpeg.so 2>/dev/null | tr '\n' ' ' || echo 'none found')"
+log "libffmpeg in chromium dir: $(ls -la "$CHROMIUM_DIR/libffmpeg.so" 2>/dev/null || echo 'NOT FOUND')"
+log "=== END DIAGNOSTIC ==="
+# ─────────────────────────────────────────────────────────────────────────────
+
 IFS='|' read -r FPS JPEG CHROME_OPT < <(read_options)
 
 if ! CHROME_BIN="$(pick_browser "$CHROME_OPT")"; then

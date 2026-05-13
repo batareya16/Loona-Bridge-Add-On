@@ -57,6 +57,26 @@ RUN set -eux; \
         chromium \
         chromium-codecs-ffmpeg-extra; \
       rm /etc/apt/sources.list.d/raspi.list; \
+      echo "=== chromium packages installed ===" && dpkg -l | grep chromium; \
+      echo "=== chromium binary location ===" && ls -la /usr/bin/chromium* 2>/dev/null || true; \
+      CHROMIUM_REAL=$(readlink -f /usr/bin/chromium 2>/dev/null || echo ""); \
+      CHROMIUM_DIR=$(dirname "$CHROMIUM_REAL" 2>/dev/null || echo ""); \
+      echo "chromium real path: $CHROMIUM_REAL  dir: $CHROMIUM_DIR"; \
+      echo "=== all libffmpeg.so on system ===" && find /usr/lib /usr/local/lib -name "libffmpeg.so" 2>/dev/null; \
+      FFMPEG_SO=$(find /usr/lib /usr/local/lib -name "libffmpeg.so" 2>/dev/null | head -1); \
+      echo "found libffmpeg.so: $FFMPEG_SO"; \
+      if [ -n "$FFMPEG_SO" ] && [ -n "$CHROMIUM_DIR" ] && [ "$CHROMIUM_DIR" != "/" ]; then \
+        DEST="$CHROMIUM_DIR/libffmpeg.so"; \
+        if [ "$FFMPEG_SO" != "$DEST" ]; then \
+          echo "Copying $FFMPEG_SO → $DEST"; \
+          cp "$FFMPEG_SO" "$DEST"; \
+        else \
+          echo "libffmpeg.so already in correct place: $DEST"; \
+        fi; \
+      else \
+        echo "WARNING: could not fix libffmpeg.so path (ffmpeg=$FFMPEG_SO chromiumDir=$CHROMIUM_DIR)"; \
+      fi; \
+      echo "=== final check ===" && ls -la "$CHROMIUM_DIR"/libffmpeg.so 2>/dev/null || echo "NO libffmpeg.so in chromium dir!"; \
     else \
       # amd64: Google Chrome has H.264 built-in.
       curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
