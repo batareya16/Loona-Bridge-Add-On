@@ -1,4 +1,8 @@
-# Raspberry Pi experiment: use RPi Chromium build + codecs on ARM64.
+# Chromium (Debian Bookworm) — Broadway.js decodes H.264 in pure JS/WASM.
+# No proprietary H.264 decoder needed: Chromium negotiates H.264 via OpenH264
+# (SDP OK), assembles RTP → jitter-buffer (framesReceived > 0),
+# and Insertable Streams intercepts encoded frames before the broken decoder.
+# Broadway.js (bridge/broadway.js + avc.wasm) then decodes in software.
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
@@ -13,7 +17,7 @@ RUN apt-get update \
         nodejs \
         npm \
         fonts-liberation \
-        libasound2 \
+        libasound2t64 \
         libatk-bridge2.0-0 \
         libatk1.0-0 \
         libcairo2 \
@@ -34,43 +38,16 @@ RUN apt-get update \
         libxkbcommon0 \
         libxrandr2 \
         libxshmfence1 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN set -eux; \
-    ARCH="$(dpkg --print-architecture)"; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends curl gnupg ca-certificates; \
-    \
-    if [ "$ARCH" = "arm64" ]; then \
-      # 1. СКАЧИВАЕМ КЛЮЧ (правильный путь)
-      curl -fsSL https://raspberrypi.org | gpg --dearmor -o /usr/share/keyrings/raspberrypi-archive-keyring.gpg; \
-      \
-      # 2. ДОБАВЛЯЕМ РЕПОЗИТОРИЙ (обязательно archive... и bookworm)
-      echo "deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.gpg] http://raspberrypi.org bookworm main" > /etc/apt/sources.list.d/raspi.list; \
-      \
-      apt-get update; \
-      \
-      # 3. УСТАНОВКА (в Bookworm пакет называется просто chromium, но из этого репо он с патчами)
-      apt-get install -y --no-install-recommends \
         chromium \
-        chromium-common \
-        libavcodec-extra \
-        libexif12 \
-        libgl1-mesa-dri; \
-        \
-      # Создаем симлинк, чтобы Puppeteer всегда находил путь chromium-browser
-      ln -s /usr/bin/chromium /usr/bin/chromium-browser; \
-    else \
-      apt-get install -y --no-install-recommends chromium; \
-    fi; \
-    rm -rf /var/lib/apt/lists/*
+    && ln -sf /usr/bin/chromium /usr/bin/chromium-browser \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/loona-bridge
 
 COPY bridge/package.json ./
 ENV PUPPETEER_SKIP_DOWNLOAD=true \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 RUN npm install --omit=dev \
     && npm cache clean --force

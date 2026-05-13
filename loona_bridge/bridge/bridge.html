@@ -249,120 +249,116 @@
 
         const remoteTrack = user.videoTrack;
 
-        // ── Canvas capture from native H.264 decode ───────────────────────────
-        // Chrome-for-Testing / Chromium (open-source) has NO H.264 at any level:
-        // framesRx=0 confirmed — the RTP depacketizer itself is absent.
-        // Broadway + Insertable Streams cannot work because there are no frames
-        // to intercept.
+        // ── Insertable Streams + Broadway.js H.264 decode ────────────────────
+        // ALL open-source Chromium builds (Debian, Alpine, RPi, Brave) lack the
+        // proprietary FFmpeg H.264 DECODER but DO assemble H.264 RTP packets into
+        // jitter-buffer frames (framesReceived > 0, framesDecoded = 0).
         //
-        // This approach requires a browser WITH H.264:
-        //   Linux ARM64: Google Chrome ≥116, Brave, or Microsoft Edge.
-        //   Install: apt-get install google-chrome-stable  (or brave-browser)
-        //   bridge.js already checks /usr/bin/google-chrome automatically.
+        // createEncodedStreams() intercepts those encoded frames BEFORE the broken
+        // decoder. Broadway.js (pure JS / WASM, already loaded by bridge.js) then
+        // decodes them in software — no proprietary codec needed.
         //
-        // Flow: Agora decodes H.264 → renders to <video> element →
-        //        canvas.drawImage(videoEl) at FPS → JPEG → WebSocket.
+        // Requirements (already met):
+        //   • encodedInsertableStreams:true — patched in RTCPeerConnection above
+        //   • Broadway Decoder global — injected by bridge.js addScriptTag()
+        //   • avc.wasm — fetch-intercepted by bridge.js WASM intercept
 
         const FPS        = cfg.fps || 15;
         const QUALITY    = cfg.jpeg_quality || 0.7;
-        const minInterval = 1000 / FPS;
+        const msPerFrame = 1000 / FPS;
         const grabCanvas = document.getElementById('grab');
         const grabCtx    = grabCanvas.getContext('2d');
-        let capturedFrames = 0;
-        let firstFrameLogged = false;
-        let lastSendTs = 0;
+        let decodedFrames = 0, sentFrames = 0, intercepted = 0, lastSendTs = 0;
 
-        // Let Agora render into our container div.
-        const container = document.getElementById('remote-container');
-        try {
-          await remoteTrack.play(container);
-          log('[video] remoteTrack.play() OK');
-        } catch (e) {
-          log('[video] remoteTrack.play() error: ' + e.message);
-        }
-
-        // Wait up to 10 s for Agora's internal <video> to have decoded dimensions.
-        // No dimensions = no H.264 decoder in this browser.
-        let videoEl = null;
-        for (let i = 0; i < 100; i++) {
-          await new Promise(r => setTimeout(r, 100));
-          const v = container.querySelector('video');
-          if (v && v.videoWidth > 0 && v.videoHeight > 0) { videoEl = v; break; }
-        }
-        if (videoEl) {
-          log('[video] <video> ready: ' + videoEl.videoWidth + 'x' + videoEl.videoHeight);
-        } else {
-          log('[video] WARN: no decoded video after 10 s');
-          log('[video] FIX: browser lacks H.264 — install Google Chrome for Linux ARM64:');
-          log('[video]   apt-get install -y wget && \\');
-          log('[video]   wget https://dl.google.com/linux/direct/google-chrome-stable_current_arm64.deb && \\');
-          log('[video]   dpkg -i google-chrome-stable_current_arm64.deb || apt-get install -f -y');
-          log('[video] Retrying canvas capture — will log FIRST CAPTURE when video appears.');
-        }
-
-        // Periodic stats — use Agora's track stats (no PC digging needed).
-        let statsCount = 0;
-        setInterval(async () => {
-          statsCount++;
-          let raw = {};
+        // ── Find RTCPeerConnection (Agora creates it internally) ──────────────
+        const isPC = (o) => o && typeof o === 'object' &&
+          typeof o.getStats === 'function' && typeof o.getReceivers === 'function';
+        const findPC = (obj, depth) => {
+          if (depth > 7 || !obj || typeof obj !== 'object') return null;
+          if (isPC(obj)) return obj;
           try {
-            // Find the PC lazily for stats (no Insertable Streams usage).
-            const isPC = (o) => o && typeof o === 'object' &&
-              typeof o.getStats === 'function' && typeof o.getReceivers === 'function';
-            const findPC = (obj, d) => {
-              if (d > 7 || !obj || typeof obj !== 'object') return null;
-              if (isPC(obj)) return obj;
-              try { for (const k of Object.keys(obj)) {
-                try { const v = obj[k];
-                  if (v && typeof v === 'object' && !Array.isArray(v)) {
-                    const r = findPC(v, d + 1); if (r) return r; }
-                } catch (_) {}
-              }} catch (_) {}
-              return null;
-            };
-            const pc = findPC(rtcClient, 0);
-            if (pc) {
-              const report = await pc.getStats();
-              let codecs = [];
-              report.forEach((r) => {
-                if (r.type === 'inbound-rtp' && r.kind === 'video')
-                  raw = {bytes: r.bytesReceived, pkts: r.packetsReceived,
-                         framesRx: r.framesReceived, framesDec: r.framesDecoded,
-                         kf: r.keyFramesDecoded};
-                if (r.type === 'codec' && statsCount === 1)
-                  codecs.push(r.mimeType + '/pt=' + r.payloadType);
-              });
-              if (statsCount === 1 && codecs.length)
-                log('[stats] codecs: ' + codecs.join(', '));
+            for (const k of Object.keys(obj)) {
+              try {
+                const v = obj[k];
+                if (v && typeof v === 'object' && !Array.isArray(v)) {
+                  const r = findPC(v, depth + 1);
+                  if (r) return r;
+                }
+              } catch (_) {}
             }
           } catch (_) {}
-          log('[video] captured=' + capturedFrames +
-              ' raw.bytes='  + (raw.bytes    || 0) +
-              ' framesRx='   + (raw.framesRx  != null ? raw.framesRx  : '?') +
-              ' framesDec='  + (raw.framesDec != null ? raw.framesDec : '?') +
-              ' raw.kf='     + (raw.kf || 0));
-        }, 5000);
+          return null;
+        };
 
-        // Canvas capture loop.
-        const tick = () => {
-          // Re-query in case Agora replaced the element.
-          if (!videoEl || videoEl.videoWidth === 0)
-            videoEl = container.querySelector('video') || null;
+        // Agora creates the PC asynchronously after subscribe — poll for it.
+        let pc = null;
+        for (let i = 0; i < 80; i++) {
+          pc = findPC(rtcClient, 0);
+          if (pc) break;
+          await new Promise(r => setTimeout(r, 100));
+        }
+        if (!pc) {
+          log('[Broadway] FATAL: RTCPeerConnection not found after 8 s — giving up');
+          broadwayActive = false;
+          return;
+        }
+        log('[Broadway] RTCPeerConnection found');
 
-          if (videoEl && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
-            const w = videoEl.videoWidth, h = videoEl.videoHeight;
-            if (grabCanvas.width  !== w) grabCanvas.width  = w;
-            if (grabCanvas.height !== h) grabCanvas.height = h;
-            grabCtx.drawImage(videoEl, 0, 0);
-            capturedFrames++;
-            if (!firstFrameLogged) {
-              firstFrameLogged = true;
-              log('[video] FIRST CAPTURE — ' + w + 'x' + h);
+        // ── Find video RTCRtpReceiver ─────────────────────────────────────────
+        const videoReceiver = pc.getReceivers().find(r => r.track && r.track.kind === 'video');
+        if (!videoReceiver) {
+          log('[Broadway] FATAL: no video receiver on PeerConnection');
+          broadwayActive = false;
+          return;
+        }
+        log('[Broadway] video receiver found — opening encoded stream');
+
+        // ── Open encoded stream ───────────────────────────────────────────────
+        let readable, writable;
+        try {
+          ({readable, writable} = videoReceiver.createEncodedStreams());
+        } catch (e) {
+          log('[Broadway] FATAL createEncodedStreams(): ' + e.message);
+          log('[Broadway] Make sure RTCPeerConnection patch (encodedInsertableStreams) loaded before SDK');
+          broadwayActive = false;
+          return;
+        }
+
+        // ── Initialise Broadway decoder ───────────────────────────────────────
+        if (typeof Decoder === 'undefined') {
+          log('[Broadway] FATAL: Decoder global not found — broadway.js not loaded');
+          broadwayActive = false;
+          return;
+        }
+        const broadwayDecoder = new Decoder({
+          rgb: true,
+          onPictureDecoded: (data, width, height) => {
+            decodedFrames++;
+            if (grabCanvas.width  !== width)  grabCanvas.width  = width;
+            if (grabCanvas.height !== height) grabCanvas.height = height;
+
+            // Broadway rgb=true → Uint8Array of R,G,B bytes (3 bytes/pixel).
+            // ImageData needs R,G,B,A (4 bytes/pixel).
+            const imgData = grabCtx.createImageData(width, height);
+            const src = (data instanceof Uint8Array) ? data : new Uint8Array(data);
+            const dst = imgData.data;
+            for (let i = 0, j = 0; i < src.length; i += 3, j += 4) {
+              dst[j]     = src[i];       // R
+              dst[j + 1] = src[i + 1];  // G
+              dst[j + 2] = src[i + 2];  // B
+              dst[j + 3] = 255;          // A
             }
+            grabCtx.putImageData(imgData, 0, 0);
+
+            if (decodedFrames === 1)
+              log('[Broadway] ✓ FIRST DECODED FRAME — ' + width + 'x' + height);
+
+            // Throttle to target FPS before encoding as JPEG.
             if (ws.readyState === 1) {
               const now = Date.now();
-              if (now - lastSendTs >= minInterval) {
+              if (now - lastSendTs >= msPerFrame) {
                 lastSendTs = now;
+                sentFrames++;
                 grabCanvas.toBlob((blob) => {
                   if (!blob) return;
                   blob.arrayBuffer().then((buf) => {
@@ -372,10 +368,77 @@
               }
             }
           }
-          setTimeout(tick, minInterval);
-        };
-        tick();
-        log('[video] canvas capture loop started');
+        });
+        log('[Broadway] decoder ready — consuming encoded H.264 frames...');
+
+        // ── Consume encoded stream ────────────────────────────────────────────
+        // Forward each frame to writable as well — required to prevent
+        // ReadableStream backpressure (browser expects both sides consumed).
+        const esReader = readable.getReader();
+        const esWriter = writable.getWriter();
+
+        (async () => {
+          // Warn if no frames arrive in first 8 s — means browser didn't
+          // negotiate H.264 in SDP at all (check framesReceived in stats).
+          const warnTimer = setTimeout(() => {
+            if (intercepted === 0) {
+              log('[Broadway] WARN: 0 encoded frames in 8 s');
+              log('[Broadway]   → browser may not advertise H.264 in SDP');
+              log('[Broadway]   → check stats: framesRx should be > 0');
+            }
+          }, 8000);
+          try {
+            while (true) {
+              const {done, value} = await esReader.read();
+              if (done) { log('[Broadway] encoded stream ended'); break; }
+              intercepted++;
+              if (intercepted === 1)
+                log('[Broadway] FIRST encoded frame: byteLength=' + value.data.byteLength +
+                    ' type=' + (value.type || '?'));
+              // Decode with Broadway.
+              try {
+                broadwayDecoder.decode(new Uint8Array(value.data));
+              } catch (e) {
+                if (intercepted < 5)
+                  log('[Broadway] decode error (frame ' + intercepted + '): ' + e.message);
+              }
+              // Forward to browser's (broken) H.264 decoder — prevents backpressure.
+              try { esWriter.write(value); } catch (_) {}
+            }
+          } catch (e) {
+            log('[Broadway] stream read error: ' + e.message);
+          }
+          clearTimeout(warnTimer);
+        })();
+
+        // ── Periodic stats ────────────────────────────────────────────────────
+        let statsCount = 0;
+        setInterval(async () => {
+          statsCount++;
+          let raw = {};
+          let codecs = [];
+          try {
+            const report = await pc.getStats();
+            report.forEach(r => {
+              if (r.type === 'inbound-rtp' && r.kind === 'video')
+                raw = {bytes: r.bytesReceived, framesRx: r.framesReceived,
+                       framesDec: r.framesDecoded, kf: r.keyFramesDecoded};
+              if (r.type === 'codec' && statsCount === 1)
+                codecs.push(r.mimeType + '/pt=' + r.payloadType);
+            });
+            if (statsCount === 1 && codecs.length)
+              log('[stats] codecs: ' + codecs.join(', '));
+          } catch (_) {}
+          log('[Broadway] intercepted=' + intercepted +
+              ' decoded=' + decodedFrames +
+              ' sent=' + sentFrames +
+              ' raw.bytes=' + (raw.bytes || 0) +
+              ' framesRx=' + (raw.framesRx  != null ? raw.framesRx  : '?') +
+              ' framesDec=' + (raw.framesDec != null ? raw.framesDec : '?') +
+              ' kf=' + (raw.kf || 0));
+        }, 5000);
+
+        log('[Broadway] pipeline started — waiting for first encoded frame');
       });
 
       rtcClient.on('user-unpublished', (user, mediaType) => {

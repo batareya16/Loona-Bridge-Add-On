@@ -117,6 +117,7 @@ function findSdkFile(pkgName, candidates) {
     {path: '/Applications/Vivaldi.app/Contents/MacOS/Vivaldi',                            hasCodecs: true,  label: 'Vivaldi'},
     {path: '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',  hasCodecs: true,  label: 'Chrome Canary'},
     {path: '/usr/bin/google-chrome',                                                       hasCodecs: true,  label: 'google-chrome (linux)'},
+    {path: '/usr/bin/brave-browser',                                                       hasCodecs: true,  label: 'brave-browser (linux)'},
     // Chromium last — its codec support depends on build, often missing H.264.
     {path: '/Applications/Chromium.app/Contents/MacOS/Chromium',                          hasCodecs: false, label: 'Chromium (no H.264!)'},
     {path: '/usr/bin/chromium-browser',                                                    hasCodecs: false, label: 'chromium-browser (linux)'},
