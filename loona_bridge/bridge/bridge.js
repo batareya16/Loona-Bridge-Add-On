@@ -145,9 +145,10 @@ function findSdkFile(pkgName, candidates) {
 
   console.error('[bridge] Firefox launched');
 
-  const context = await browser.newContext({
-    permissions: ['microphone', 'camera'],
-  });
+  // Firefox permissions are handled via firefoxUserPrefs above
+  // (media.navigator.permission.disabled = true).
+  // Playwright's newContext permissions API is Chromium-only — not supported in Firefox.
+  const context = await browser.newContext();
   const page = await context.newPage();
 
   // Disable all timeouts — startAgora can legitimately take >30 s on slow networks.
