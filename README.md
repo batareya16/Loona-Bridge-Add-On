@@ -1,6 +1,8 @@
 # Loona Bridge — аддон для Home Assistant
 
-Docker-аддон запускает ваш существующий **Node + Puppeteer + `bridge.js`**, подключается по WebSocket к Home Assistant Core и забирает кадры Agora. Сборка по умолчанию: **Node Alpine + Chromium через `apk`** (Supervisor часто подставляет Alpine; в Dockerfile есть запасной путь с **`apt-get`** для Debian-образов). При необходимости укажите **`chrome_path`**, если нужен другой браузер с H.264.
+Docker-аддон запускает **Node + Puppeteer + `bridge.js`**, подключается по WebSocket к Core. Образ на **Debian bookworm-slim**: ставится **Chromium** и при возможности скачивается **Google Chrome** (.deb arm64/amd64) — без Chrome/Chromium с кодеками Loona часто даёт «no decoded video» и `framesDec=0`. **`run.sh`** сам выбирает `google-chrome-stable`, если он установился при сборке.
+
+Опционально **`chrome_path`** в настройках аддона, если браузер нестандартный.
 
 Состав репозитория:
 
@@ -22,6 +24,10 @@ cp -R /path/to/custom_components/loona/bridge ./loona_bridge/
 3. Добавьте URL вида `https://github.com/<user>/<repo>` и сохраните.
 4. Обновите страницу магазина — появится аддон **Loona Agora Bridge**.
 5. Установите аддон. Первая сборка на Raspberry Pi может занять много времени.
+
+**Если в логе сборки видно только `apt-get` и ошибку 127:** Supervisor всё ещё берёт **старый Dockerfile** из Git. Откройте в браузере сырой файл `loona_bridge/Dockerfile` на GitHub — первые строки должны быть `apk add`, не `apt-get`. Затем push на `main`, в HA: репозиторий → обновить, аддон переустановить (версия **0.1.3+**).
+
+**`npm: not found` при сборке:** Supervisor подставляет базовый образ без Node — в образе ставятся **`nodejs` и `npm` из Alpine через `apk`** (с версии аддона **0.1.3**).
 6. Запуск: **Выключено вручную** по умолчанию (`manual_only`) — перед просмотром камеры включите аддон (**Старт**).
 
 ## Способ 2: Локальная папка `/addons` (HAOS + Samba)

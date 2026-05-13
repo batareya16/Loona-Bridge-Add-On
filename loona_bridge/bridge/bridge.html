@@ -130,7 +130,7 @@
       return out;
     };
 
-    /** Called from puppeteer after the page loads. */
+    /** Called from bridge.js (Playwright) after the page loads. */
     window.startAgora = async (cfg) => {
       log('config: ' + JSON.stringify({...cfg, token: cfg.token?.slice(0, 12) + '...',
                                             rtm_token: cfg.rtm_token?.slice(0, 12) + '...'}));
@@ -213,18 +213,16 @@
         }
         if (mediaType !== 'video') return;
         if (broadwayActive) {
-          log('[Broadway] already running — resubscribe complete, new IDR expected');
+          log('[video] already running — resubscribe complete, new IDR expected');
           return;
         }
         broadwayActive = true;
 
         const remoteTrack = user.videoTrack;
 
-        // ── Canvas capture — requires browser to decode H.264 natively ────────
-        // Requires chromium-codecs-ffmpeg-extra (RPi repo) — provides
-        // libffmpeg.so WITH H.264. Without it framesReceived=0 and video is black.
-        // arm64: RPi chromium + chromium-codecs-ffmpeg-extra (see Dockerfile).
-        // amd64: Google Chrome (H.264 built-in).
+        // ── Canvas capture — Firefox decodes H.264 via built-in OpenH264 ──────
+        // Firefox (Playwright) ships OpenH264 (Cisco) for WebRTC on all platforms
+        // including ARM64 — no proprietary codec package needed.
 
         const FPS        = cfg.fps || 15;
         const QUALITY    = cfg.jpeg_quality || 0.7;
@@ -254,7 +252,7 @@
           log('[video] <video> ready: ' + videoEl.videoWidth + 'x' + videoEl.videoHeight);
         } else {
           log('[video] WARN: no decoded video after 10 s — H.264 not working');
-          log('[video] arm64 fix: chromium-codecs-ffmpeg-extra must be installed from RPi repo');
+          log('[video] Firefox+OpenH264: check that media.gmp-gmpopenh264.enabled=true');
           log('[video] Canvas loop still running — will capture when video appears.');
         }
 
@@ -426,7 +424,7 @@
         };
       }
 
-      // Keep alive forever; puppeteer closes the page on bridge.js exit.
+      // Keep alive forever; bridge.js closes the browser on SIGTERM/SIGINT.
       return rtcUid;
     };
 
