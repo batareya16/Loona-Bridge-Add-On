@@ -80,42 +80,13 @@
               white-space: pre-wrap; word-break: break-all; font-size: 11px;
               border: 1px solid #333; }
   </style>
-  <script>
-    // ── RTCPeerConnection patch: enable Insertable Streams API ───────────────
-    // Chrome 94+ supports RTCRtpReceiver.createEncodedStreams() which lets us
-    // intercept raw H.264 NAL-unit data BEFORE the browser's codec pipeline.
-    // Broadway.js then decodes in pure JS — no native H.264 support needed.
-    //
-    // The flag must be in the RTCPeerConnection constructor config.  Agora SDK
-    // creates the PC internally, so we patch the constructor before SDK load.
-    (function patchRTCForInsertableStreams() {
-      if (typeof RTCPeerConnection === 'undefined') return;
-      const Orig = window.RTCPeerConnection;
-      function RTCPeerConnectionPatched(config) {
-        // Return a native RTCPeerConnection with encodedInsertableStreams added.
-        return new Orig({...(config || {}), encodedInsertableStreams: true});
-      }
-      // Make instanceof + prototype chain work correctly.
-      RTCPeerConnectionPatched.prototype = Orig.prototype;
-      Object.setPrototypeOf(RTCPeerConnectionPatched, Orig);
-      try { Object.defineProperty(RTCPeerConnectionPatched, 'name',
-              {value: 'RTCPeerConnection'}); } catch (_) {}
-      window.RTCPeerConnection = RTCPeerConnectionPatched;
-
-      // Also patch setConfiguration: Agora SDK calls it to update ICE servers.
-      // If the new config omits encodedInsertableStreams Chrome throws
-      // "unsupported modification" because the flag can't be toggled after
-      // construction.  Always keep it true.
-      const origSetCfg = Orig.prototype.setConfiguration;
-      if (origSetCfg) {
-        Orig.prototype.setConfiguration = function(config) {
-          return origSetCfg.call(this, {...(config || {}), encodedInsertableStreams: true});
-        };
-      }
-
-      console.log('[pc-patch] RTCPeerConnection + setConfiguration patched: encodedInsertableStreams=true');
-    })();
-  </script>
+  <!-- encodedInsertableStreams patch REMOVED.
+       That flag forces Chrome's encoded-transform pipeline which requires a
+       registered H.264 decoder factory. Without the factory (all Chromium
+       builds without proprietary FFmpeg) the entire receive pipeline stalls
+       and framesReceived stays 0 forever — even though bytesReceived grows.
+       Canvas capture only needs the standard decode pipeline, so the patch
+       is not only unnecessary but actively harmful. -->
 </head>
 <body>
   <div id="remote-container"></div>
