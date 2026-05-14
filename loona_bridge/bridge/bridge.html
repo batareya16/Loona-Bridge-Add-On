@@ -73,12 +73,11 @@
               result = result.replace(plid, '42e01f');
               console.log('[sdp-patch] PT=' + pt + ' ' + pname + '(' + plid + ') → CBP(42e01f)');
             }
-            // Only inject into answer SDPs — that's what tells the robot to embed SPS/PPS.
-            // Modifying remote (robot's offer) SDP is pointless and noisy.
-            if (isAnswer && !result.includes('sps-pps-idr-in-keyframe')) {
-              result += ';sps-pps-idr-in-keyframe=1';
-              console.log('[sdp-patch] PT=' + pt + ' +sps-pps-idr-in-keyframe');
-            }
+            // sps-pps-idr-in-keyframe=1 intentionally NOT injected here.
+            // When present in setLocalDescription, Firefox 128's H264 depacketizer
+            // appears to wait for inline SPS+PPS in every IDR before assembling frames.
+            // The Agora edge does NOT send inline SPS+PPS → framesReceived stays 0.
+            // Removing this parameter lets the jitter buffer assemble frames normally.
             return result;
           }
         );
@@ -107,7 +106,7 @@
           } else {
             const hasH264 = /H264|h264/i.test(answer.sdp);
             console.log('[sdp-patch] createAnswer: H264=' + hasH264 +
-              (hasH264 ? ' sps-pps-idr-in-keyframe already present ✓' : ' (no H264 in answer)'));
+              (hasH264 ? ' no profile patch needed' : ' (no H264 in answer)'));
           }
         }
         return answer;
@@ -121,8 +120,8 @@
             const hasH264 = /H264|h264/i.test(init.sdp);
             const patched = injectSpsParam(init.sdp, 'answer');
             console.log('[sdp-patch] ' + method + ': H264=' + hasH264 +
-              (patched !== init.sdp ? ' → PATCHED sps-pps-idr-in-keyframe=1' :
-               hasH264 ? ' sps-pps-idr-in-keyframe already ✓' : ''));
+              (patched !== init.sdp ? ' → PATCHED (profile downgrade)' :
+               hasH264 ? ' no patch needed' : ''));
             if (patched !== init.sdp) {
               return orig.call(this, { type: init.type, sdp: patched });
             }
@@ -133,10 +132,14 @@
         };
       }
       wrapSetDesc(RTCPeerConnection.prototype, 'setLocalDescription');
-      // setRemoteDescription: no logging needed (remote SDP is from robot, we only care about local answer)
+      // setRemoteDescription: log robot's offer m=video + fmtp (shows actual codec/profile/params).
       const origSetRemoteDesc = RTCPeerConnection.prototype.setRemoteDescription;
       RTCPeerConnection.prototype.setRemoteDescription = function(init) {
         if (init && init.sdp) {
+          const mvLine = init.sdp.match(/m=video[^\r\n]+/);
+          const fmtpLines = init.sdp.match(/a=fmtp:\d+[^\r\n]+/g) || [];
+          if (mvLine) console.log('[sdp-offer] ' + mvLine[0]);
+          fmtpLines.forEach(l => console.log('[sdp-offer] ' + l));
           const patched = injectSpsParam(init.sdp, 'remote');
           if (patched !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: patched });
         }
@@ -468,21 +471,51 @@
             const pc = findPC(rtcClient, 0);
             if (pc) {
               const report = await pc.getStats();
+              // Build codec map (id → {mimeType, payloadType})
+              const codecMap = {};
+              report.forEach((r) => { if (r.type === 'codec') codecMap[r.id] = r; });
+
+              const videoRx = [];
               report.forEach((r) => {
                 if (r.type === 'inbound-rtp' && r.kind === 'video') {
+                  videoRx.push(r);
                   raw = {bytes: r.bytesReceived, framesRx: r.framesReceived,
                          framesDec: r.framesDecoded, kf: r.keyFramesDecoded,
                          impl: r.decoderImplementation,
                          pkt: r.packetsReceived,
                          jbe: r.jitterBufferEmittedCount};
-                  // First interval: dump all numeric fields for diagnosis
-                  if (statsCount === 1) {
-                    const vals = Object.entries(r)
-                      .filter(([,v]) => typeof v === 'number')
-                      .map(([k,v]) => k + '=' + v).join(' ');
-                    log('[stats-dbg] ' + vals);
-                  }
+                }
+              });
+
+              // First interval: dump all fields for every video rx entry
+              if (statsCount === 1) {
+                videoRx.forEach((r, i) => {
+                  const codec = r.codecId && codecMap[r.codecId];
+                  const numVals = Object.entries(r)
+                    .filter(([,v]) => typeof v === 'number')
+                    .map(([k,v]) => k + '=' + v).join(' ');
+                  const strVals = Object.entries(r)
+                    .filter(([k,v]) => typeof v === 'string' && k !== 'id' && k !== 'type')
+                    .map(([k,v]) => k + '=' + v).join(' ');
+                  log('[stats-dbg#' + i + '] ssrc=' + r.ssrc +
+                    (codec ? ' codec=' + codec.mimeType + ' pt=' + codec.payloadType : '') +
+                    ' | ' + numVals);
+                  if (strVals) log('[stats-dbg#' + i + '-str] ' + strVals);
+                });
+                if (videoRx.length === 0) log('[stats-dbg] no inbound-rtp video entries in getStats()');
               }
+
+              // Log all video streams (there may be >1 SSRC)
+              videoRx.forEach((r) => {
+                const codec = r.codecId && codecMap[r.codecId];
+                log('[stats-rx] ssrc=' + r.ssrc +
+                  (codec ? ' ' + codec.mimeType + '/pt=' + codec.payloadType : '') +
+                  ' bytes=' + r.bytesReceived + ' pkt=' + r.packetsReceived +
+                  ' rx=' + (r.framesReceived != null ? r.framesReceived : '?') +
+                  ' jbe=' + (r.jitterBufferEmittedCount != null ? r.jitterBufferEmittedCount : '?') +
+                  ' dec=' + (r.framesDecoded != null ? r.framesDecoded : '?') +
+                  ' kf=' + (r.keyFramesDecoded || 0) +
+                  (r.decoderImplementation ? ' impl=' + r.decoderImplementation : ''));
               });
             }
           } catch (_) {}
