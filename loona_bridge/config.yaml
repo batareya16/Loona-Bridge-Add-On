@@ -1,6 +1,6 @@
 ---
 name: Loona Agora Bridge
-version: "0.1.38"
+version: "0.1.39"
 slug: loona_bridge
 description: >
   Playwright/Firefox bridge для видео Loona через Agora RTC (H.264 via built-in libavcodec).

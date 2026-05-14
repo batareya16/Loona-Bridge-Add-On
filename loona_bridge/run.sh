@@ -3,7 +3,19 @@ set -euo pipefail
 
 OPTIONS_FILE="${OPTIONS_FILE:-/data/options.json}"
 CONFIG_JSON="/ha_config/.loona/bridge-config.json"
-HA_WS_HOST="${HA_WS_HOST:-homeassistant}"
+
+# Resolve HA Core address — with host_network Docker's internal DNS
+# ('homeassistant') is not in the host network namespace's resolver.
+# Try getent (honours /etc/hosts written by Supervisor), then python3,
+# then fall back to the bare hostname and let Firefox try its luck.
+HA_WS_HOST="${HA_WS_HOST:-}"
+if [[ -z "$HA_WS_HOST" ]]; then
+  HA_WS_HOST=$(getent hosts homeassistant 2>/dev/null | awk 'NR==1{print $1}')
+fi
+if [[ -z "$HA_WS_HOST" ]]; then
+  HA_WS_HOST=$(python3 -c "import socket; print(socket.gethostbyname('homeassistant'))" 2>/dev/null || true)
+fi
+[[ -z "$HA_WS_HOST" ]] && HA_WS_HOST="homeassistant"
 
 log() {
   echo "[loona-bridge] $*"
@@ -42,6 +54,7 @@ if [[ -f "$FF_BIN" ]]; then
 fi
 log "=== END DIAGNOSTIC ==="
 
+log "HA WS host resolved: $HA_WS_HOST"
 log "defaults from options: $(read_options)"
 
 while true; do

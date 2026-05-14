@@ -343,6 +343,23 @@
       const rtcCodec = cfg.codec    || 'h264';
       const rtcClient = AgoraRTC.createClient({mode: rtcMode, codec: rtcCodec, role: rtcRole});
 
+      // ── Agora connection diagnostics ─────────────────────────────────────────
+      rtcClient.on('connection-state-change', (curState, prevState, reason) => {
+        log('[rtc-state] ' + prevState + ' → ' + curState +
+            (reason ? ' (' + reason + ')' : ''));
+      });
+      rtcClient.on('exception', (evt) => {
+        log('[rtc-except] code=' + evt.code + ' msg=' + evt.msg +
+            (evt.uid != null ? ' uid=' + evt.uid : ''));
+      });
+      rtcClient.on('network-quality', (stats) => {
+        // Log only when quality degrades (0=unknown,1=excellent…6=dead)
+        if (stats.downlinkNetworkQuality > 3 || stats.uplinkNetworkQuality > 3) {
+          log('[rtc-quality] down=' + stats.downlinkNetworkQuality +
+              ' up=' + stats.uplinkNetworkQuality);
+        }
+      });
+
       // Guard: Broadway pipeline is set up only once per video session.
       // The keyframe-forcer may trigger resubscribe → user-published fires again;
       // we must NOT create a second Decoder or open a second encoded stream.
