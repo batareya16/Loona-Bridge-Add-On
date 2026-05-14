@@ -353,9 +353,32 @@
         log('[webcodecs] VideoDecoder API absent — Agora will use browser GMP path');
       }
 
-      // NOTE: setParameter('DISABLE_WEBCODECS', true) and similar were tried but
-      // caused Agora v4.24 to lose its video RTCPeerConnection entirely, making
-      // bytesReceived=0 and no inbound-rtp stats.  Removed — do not add back.
+      // Hide VideoDecoder from Agora SDK before createClient so the SDK falls
+      // back to the native Firefox WebRTC H.264 pipeline (GMP decoder).
+      //
+      // WHY: Agora SDK v4.24+ uses window.VideoDecoder (WebCodecs) for H.264
+      // decode when it's available.  Firefox on ARM64 Linux reports H.264
+      // VideoDecoder as "supported", but Agora's WebCodecs path fails with
+      // RECV_VIDEO_DECODE_FAILED (code 1005) — the encoded chunks Agora feeds
+      // to VideoDecoder have wrong timestamps, wrong config, or Agora's
+      // RTCRtpScriptTransform intercepts frames before Firefox's native jitter
+      // buffer emits them (jitterBufferEmittedCount stays 0 in stats).
+      //
+      // Without VideoDecoder, Agora falls back to letting Firefox's native
+      // RTCPeerConnection H.264 pipeline handle decoding via OpenH264 GMP.
+      // That path is confirmed working: [h264-caps] supported=true smooth=true.
+      //
+      // NOTE: setParameter('DISABLE_WEBCODECS', ...) was tried and broke Agora's
+      // video inbound-rtp entirely (bytes→0).  Hiding VideoDecoder itself is safer.
+      try {
+        Object.defineProperty(window, 'VideoDecoder', {
+          value: undefined, writable: true, configurable: true,
+        });
+        log('[webcodecs] VideoDecoder hidden → Agora will use native WebRTC/GMP path');
+      } catch (e) {
+        try { window.VideoDecoder = undefined; } catch (_) {}
+        log('[webcodecs] VideoDecoder=undefined (assignment fallback): ' + e.message);
+      }
 
       // 2d) Join the Agora RTC channel.
       // Match the robot's Android Agora SDK config: mode='live' + role='host'.
