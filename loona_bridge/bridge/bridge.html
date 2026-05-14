@@ -153,9 +153,9 @@
       let wsEverOpened        = false;
       let wsConsecutiveFails  = 0;
       const WS_MAX_FAILS      = 20;   // 20 × 3 s = 60 s after first open → exit + restart
-      const WS_FIRST_TIMEOUT  = 150;  // 150 s without ever opening → stale port → exit + restart
-                                      // (Python wake_robot takes ≤90 s, so 150 s is enough
-                                      //  for a healthy start; gives up on a dead port after that)
+      const WS_FIRST_TIMEOUT  = 30;   // 30 s without ever opening → stale/dead port → exit + restart
+                                      // The WS server opens BEFORE wake_robot(), so a healthy
+                                      // bridge connects in ~15 s (Firefox launch).  30 s is plenty.
       let wsNeverOpenedTimer  = setTimeout(() => {
         if (!wsEverOpened) {
           log('[FATAL] ws never connected in ' + WS_FIRST_TIMEOUT + ' s — ' +

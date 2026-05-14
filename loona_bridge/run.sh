@@ -42,15 +42,17 @@ if [[ -f "$FF_BIN" ]]; then
 fi
 log "=== END DIAGNOSTIC ==="
 
-IFS='|' read -r FPS JPEG < <(read_options)
-log "defaults from options: fps=$FPS jpeg_quality=$JPEG"
-
-wait_for_ha_config
+log "defaults from options: $(read_options)"
 
 while true; do
+  # Always wait for a valid (ws_port > 0) config before starting bridge.js.
+  # This handles both the initial start AND restarts after _teardown() sets ws_port=0.
+  wait_for_ha_config
+
   if [[ ! -f "$CONFIG_JSON" ]]; then
-    log "config disappeared — waiting ..."
-    wait_for_ha_config
+    log "config disappeared after wait — retrying ..."
+    sleep 1
+    continue
   fi
 
   IFS='|' read -r FPS JPEG < <(read_options)
@@ -68,6 +70,5 @@ while true; do
   node /opt/loona-bridge/bridge.js
   code=$?
   set -e
-  log "bridge.js exited code=$code — retry in 5s"
-  sleep 5
+  log "bridge.js exited code=$code — waiting for camera switch ON ..."
 done
