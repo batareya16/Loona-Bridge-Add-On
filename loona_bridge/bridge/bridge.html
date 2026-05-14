@@ -142,18 +142,42 @@
       const wsUrl  = 'ws://' + wsHost + ':' + cfg.ws_port;
 
       // Use a mutable binding so tick() / stateInterval always see the live socket.
-      // Auto-reconnect: if Python tears down and restarts the WS server (e.g. after
-      // the manual-mode detection window), the bridge page re-attaches automatically.
+      // Auto-reconnect with persistent-failure detection:
+      //   If ws was never successfully opened: retry forever (Python may be slow to start).
+      //   If ws opened at least once (credentials received) but then fails N times in a
+      //   row: Python likely restarted on a NEW port — signal [FATAL] so bridge.js exits
+      //   and run.sh re-reads bridge-config.json with the updated ws_port.
       let ws;
       let _wsResolve;
       const wsFirstOpen = new Promise((res) => { _wsResolve = res; });
+      let wsEverOpened        = false;
+      let wsConsecutiveFails  = 0;
+      const WS_MAX_FAILS      = 20;  // 20 × 3 s = 60 s of solid failure → exit + restart
+
       function openWs() {
         ws = new WebSocket(wsUrl);
         ws.binaryType = 'arraybuffer';
-        ws.onopen  = () => { log('ws open'); if (_wsResolve) { _wsResolve(); _wsResolve = null; } };
+        ws.onopen = () => {
+          wsEverOpened       = true;
+          wsConsecutiveFails = 0;
+          log('ws open');
+          if (_wsResolve) { _wsResolve(); _wsResolve = null; }
+        };
         ws.onerror = () => log('ws error');
         ws.onclose = () => {
-          log('ws closed — retry in 3 s');
+          if (wsEverOpened) {
+            wsConsecutiveFails++;
+            log('ws closed — retry in 3 s (' + wsConsecutiveFails + '/' + WS_MAX_FAILS + ')');
+            if (wsConsecutiveFails >= WS_MAX_FAILS) {
+              // Python server stopped listening on this port (probably restarted on a
+              // new port written to bridge-config.json).  Signal bridge.js to exit so
+              // run.sh can restart with the fresh config.
+              log('[FATAL] ws unreachable for ' + (WS_MAX_FAILS * 3) + ' s — Python restarted? Requesting bridge restart.');
+              return;  // do NOT call setTimeout(openWs) — let bridge.js exit
+            }
+          } else {
+            log('ws closed (not yet opened) — retry in 3 s');
+          }
           setTimeout(openWs, 3000);
         };
       }
@@ -181,18 +205,21 @@
         log('Agora credentials received: channel=' + cfg.channel.slice(0,16));
       }
 
-      // 2a) Wait for H.264 WebRTC codec to be available in Firefox.
-      // Firefox downloads OpenH264 GMP from Mozilla CDN asynchronously at startup.
-      // If we create an Agora RTC client before OpenH264 is loaded, the SDP will
-      // contain only audio codecs and framesRx stays 0 forever.
-      // We poll RTCPeerConnection.createOffer() until H.264 appears in the SDP,
-      // or time out after 120 s with a warning.
+      // 2a) Wait for H.264 WebRTC codec — NO TIMEOUT, NO FALLBACK.
+      // Starting Agora without H.264 is pointless: the SDP will contain only
+      // audio codecs, framesRx stays 0 forever.  We block here indefinitely until
+      // RTCPeerConnection.createOffer() returns an SDP with H264.
+      //
+      // Normal case (prewarm succeeded): returns on the very first poll (~0 s).
+      // Fallback case (GMP downloading at runtime): polls every 2 s until ready.
+      // If OpenH264 never becomes available (GMP broken), the bridge stays here
+      // forever — which is correct: no video is better than a running Agora client
+      // that silently delivers nothing.
       await (async function waitForH264Codec() {
-        const TIMEOUT_MS = 120000;
-        const POLL_MS    = 2000;
-        const deadline   = Date.now() + TIMEOUT_MS;
+        const POLL_MS = 2000;
         log('[h264-wait] checking WebRTC H.264 availability (OpenH264 GMP)...');
-        while (Date.now() < deadline) {
+        let attempt = 0;
+        while (true) {
           let hasH264 = false;
           try {
             const pc = new RTCPeerConnection();
@@ -204,14 +231,14 @@
             log('[h264-wait] createOffer error: ' + e.message);
           }
           if (hasH264) {
-            log('[h264-wait] ✓ H.264 codec available — proceeding');
+            log('[h264-wait] ✓ H.264 codec available (attempt ' + (attempt + 1) + ') — starting Agora');
             return;
           }
-          const elapsed = Math.round((Date.now() - (deadline - TIMEOUT_MS)) / 1000);
-          log('[h264-wait] H.264 not yet available (OpenH264 GMP downloading) — ' + elapsed + 's elapsed, retrying...');
+          attempt++;
+          const elapsed = Math.round(attempt * POLL_MS / 1000);
+          log('[h264-wait] H.264 not yet available — ' + elapsed + 's elapsed, retrying...');
           await new Promise(r => setTimeout(r, POLL_MS));
         }
-        log('[h264-wait] WARN: H.264 not available after ' + (TIMEOUT_MS/1000) + 's — proceeding anyway (video will likely fail)');
       })();
 
       // 2b) Join the Agora RTC channel.

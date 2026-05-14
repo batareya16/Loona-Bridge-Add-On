@@ -33,13 +33,22 @@ RUN npm install --omit=dev \
     && DEBIAN_FRONTEND=noninteractive npx playwright install firefox --with-deps \
     && npm cache clean --force
 
-# 3) Pre-warm Firefox profile: trigger OpenH264 GMP download from Mozilla CDN.
-#    Uses RTCPeerConnection.createOffer() to trigger GMP download (more reliable
-#    than about:blank which doesn't request codec support).
+# 3) Pre-warm Firefox profile: launch Firefox, wait for OpenH264 GMP to download
+#    and register itself in the profile.  The profile with registered GMP is then
+#    baked into the image layer so H.264 is available at container start without
+#    any CDN request.
 #    Falls back gracefully if CDN unreachable — bridge.html waitForH264Codec()
 #    handles the runtime fallback.
-COPY prewarm.py ./prewarm.py
-RUN python3 prewarm.py && rm prewarm.py
+COPY prewarm.js ./prewarm.js
+RUN node prewarm.js && rm prewarm.js
+
+# Verify prewarm result — fail the build visibly if neither phase produced GMP.
+# This makes it impossible to silently ship an image with no H264 support.
+RUN echo "=== GMP prewarm verification ===" \
+    && (ls /opt/ff-profile/gmp-gmpopenh264/ 2>/dev/null && echo "Phase 1 OK: Firefox auto-downloaded GMP ✓") \
+    || (ls /opt/loona-bridge/gmp-version.json 2>/dev/null && echo "Phase 2 OK: manual GMP install ✓") \
+    || (echo "ERROR: OpenH264 GMP not installed — check internet access during build" && exit 1) \
+    && echo "=== GMP OK ==="
 
 COPY bridge/ ./
 

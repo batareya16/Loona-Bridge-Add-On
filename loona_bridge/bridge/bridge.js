@@ -136,30 +136,40 @@ function findSdkFile(pkgName, candidates) {
     try { fs.unlinkSync(path.join(PROFILE_DIR, lock)); } catch (e) {}
   }
 
-  // Check if OpenH264 GMP is pre-warmed in the Firefox binary dir (baked into image).
-  // prewarm.py places it at {PLAYWRIGHT_BROWSERS_PATH}/firefox-*/firefox/gmp-gmpopenh264/
-  const PW_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || '/opt/pw-browsers';
-  let hasGmp = false;
-  let gmpLocation = 'not found';
+  // Check how GMP was pre-warmed:
+  //   Phase 1 (Firefox auto-download): profile dir has gmp-gmpopenh264/
+  //   Phase 2 (manual install):        gmp-version.json exists with version+abi
+  // bridge.js must declare the version in firefoxUserPrefs because Playwright
+  // rewrites user.js on every launch — without it Firefox doesn't know the GMP
+  // directory to load even if the .so files are physically present.
+  const gmpProfileDir = path.join(PROFILE_DIR, 'gmp-gmpopenh264');
+  const hasGmpDir  = fs.existsSync(gmpProfileDir);
+  const GMP_INFO_PATH = path.join(__dirname, 'gmp-version.json');  // /opt/loona-bridge/gmp-version.json
+  let gmpVersionPrefs = {};
   try {
-    const { execSync } = require('child_process');
-    const ffDirs = execSync(`find "${PW_PATH}" -maxdepth 3 -name firefox -type d 2>/dev/null`)
-      .toString().trim().split('\n').filter(Boolean);
-    for (const d of ffDirs) {
-      const g = path.join(d, 'gmp-gmpopenh264');
-      if (fs.existsSync(g)) { hasGmp = true; gmpLocation = g; break; }
+    const info = JSON.parse(fs.readFileSync(GMP_INFO_PATH, 'utf8'));
+    if (info.version && info.abi) {
+      gmpVersionPrefs = {
+        // Declare the installed version so Firefox loads the manually placed .so.
+        // These override prefs.js entries — safe because prefs.js may not have them
+        // when Phase 2 (manual install) was used instead of Firefox auto-download.
+        'media.gmp-gmpopenh264.version':    info.version,
+        'media.gmp-gmpopenh264.abi':        info.abi,
+        'media.gmp-gmpopenh264.lastUpdate': Math.floor(Date.now() / 1000) - 86400,
+      };
+      console.error('[bridge] GMP manual install: v' + info.version + ' (' + info.abi + ')');
     }
-  } catch (e) {}
-  // Also check profile dir as fallback
-  if (!hasGmp && fs.existsSync(path.join(PROFILE_DIR, 'gmp-gmpopenh264'))) {
-    hasGmp = true;
-    gmpLocation = path.join(PROFILE_DIR, 'gmp-gmpopenh264') + ' (profile — may reset on rebuild!)';
+  } catch (_) {
+    // No gmp-version.json — Phase 1 was used, prefs.js has the registration already.
   }
-  console.error('[bridge] OpenH264 GMP: ' + (hasGmp ? 'YES ✓ at ' + gmpLocation : 'NO — will download on first run'));
+
+  const hasGmp = hasGmpDir || Object.keys(gmpVersionPrefs).length > 0;
+  console.error('[bridge] OpenH264 GMP pre-warmed: ' + (hasGmp ? 'YES ✓' : 'NO — will try to download at runtime'));
 
   // Launch Firefox with a PERSISTENT profile.
-  // launchPersistentContext reuses PROFILE_DIR between runs, so the OpenH264
-  // GMP download (triggered by media.gmp-gmpopenh264.enabled=true) is preserved.
+  // launchPersistentContext reuses PROFILE_DIR between runs.
+  // autoupdate is set FALSE to prevent Firefox from evicting the pre-warmed GMP
+  // by trying to fetch a newer version from a CDN that may be unreachable at runtime.
   const context = await firefox.launchPersistentContext(PROFILE_DIR, {
     headless: true,
     firefoxUserPrefs: {
@@ -169,11 +179,13 @@ function findSdkFile(pkgName, candidates) {
       // Allow WebRTC without permission prompts.
       'media.navigator.permission.disabled': true,
       'media.navigator.streams.fake':        false,
-      // OpenH264 GMP — required for WebRTC H.264 encode AND decode in Firefox.
-      // Firefox downloads ~1 MB from Mozilla CDN on first run; cached in profile.
-      'media.gmp-manager.updateEnabled':     true,  // Playwright may set this false — override
+      // OpenH264 GMP — enabled but auto-update OFF so the baked version is not
+      // replaced by a CDN download that may fail on the production network.
+      'media.gmp-manager.updateEnabled':     true,   // keep manager on for initial install
       'media.gmp-gmpopenh264.enabled':       true,
-      'media.gmp-gmpopenh264.autoupdate':    true,
+      'media.gmp-gmpopenh264.autoupdate':    false,  // OFF — don't evict pre-warmed GMP
+      // Inject version prefs when Phase 2 (manual install) was used.
+      ...gmpVersionPrefs,
       // Disable background services that slow startup.
       'app.update.enabled':                  false,
       'toolkit.telemetry.enabled':           false,
@@ -189,7 +201,16 @@ function findSdkFile(pkgName, candidates) {
   page.setDefaultTimeout(0);
   page.setDefaultNavigationTimeout(0);
 
-  page.on('console',   (msg) => console.error('[bridge js] ' + msg.text()));
+  page.on('console', (msg) => {
+    const text = msg.text();
+    console.error('[bridge js] ' + text);
+    // bridge.html signals [FATAL] when ws fails persistently — Python restarted on
+    // a new port.  Exit so run.sh re-reads bridge-config.json with the new ws_port.
+    if (text.startsWith('[FATAL]')) {
+      console.error('[bridge] fatal signal from page — exiting for run.sh restart');
+      shutdown();
+    }
+  });
   page.on('pageerror', (err) => console.error('[bridge js ERROR] ' + err.message));
 
   await page.goto('http://127.0.0.1:' + httpPort + '/', { waitUntil: 'load' });
