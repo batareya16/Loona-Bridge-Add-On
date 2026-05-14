@@ -50,6 +50,7 @@
       // OpenH264 GMP supports Baseline + Main, NOT High Profile (0x64+).
       // Agora SDK often injects High-Profile PTs into the answer SDP; the robot
       // picks the first PT it sees, sends High-Profile stream, GMP can't decode → dec=0.
+      const _fmtpLogged = {};  // log each PT's full fmtp once per session
       function injectSpsParam(sdpStr, role) {
         const isAnswer = (role === 'answer');
         return sdpStr.replace(
@@ -61,6 +62,12 @@
                           profileIdc === 0x64 ? 'High' :
                           profileIdc >= 0x64  ? 'HP+' : 'p0x' + plid.slice(0,2);
             let result = line;
+            // Log full fmtp params once per PT so we can see packetization-mode etc.
+            if (isAnswer && !_fmtpLogged[pt]) {
+              _fmtpLogged[pt] = true;
+              const fmtpParams = line.replace(/^a=fmtp:\d+ /, '');
+              console.log('[sdp-fmtp] answer PT=' + pt + ' ' + fmtpParams);
+            }
             // Downgrade High Profile → Constrained Baseline in answer SDP only.
             if (isAnswer && profileIdc >= 0x64) {
               result = result.replace(plid, '42e01f');
@@ -68,7 +75,7 @@
             }
             if (!result.includes('sps-pps-idr-in-keyframe')) {
               result += ';sps-pps-idr-in-keyframe=1';
-              console.log('[sdp-patch] PT=' + pt + ' added sps-pps-idr-in-keyframe=1');
+              console.log('[sdp-patch] PT=' + pt + ' +sps-pps-idr-in-keyframe');
             }
             return result;
           }
@@ -426,16 +433,28 @@
             if (pc) {
               const report = await pc.getStats();
               report.forEach((r) => {
-                if (r.type === 'inbound-rtp' && r.kind === 'video')
+                if (r.type === 'inbound-rtp' && r.kind === 'video') {
                   raw = {bytes: r.bytesReceived, framesRx: r.framesReceived,
                          framesDec: r.framesDecoded, kf: r.keyFramesDecoded,
-                         impl: r.decoderImplementation};
+                         impl: r.decoderImplementation,
+                         pkt: r.packetsReceived,
+                         jbe: r.jitterBufferEmittedCount};
+                  // First interval: dump all numeric fields for diagnosis
+                  if (statsCount === 1) {
+                    const vals = Object.entries(r)
+                      .filter(([,v]) => typeof v === 'number')
+                      .map(([k,v]) => k + '=' + v).join(' ');
+                    log('[stats-dbg] ' + vals);
+                  }
+              }
               });
             }
           } catch (_) {}
           log('[stats] cap=' + capturedFrames +
               ' bytes=' + (raw.bytes || 0) +
+              ' pkt='   + (raw.pkt   || 0) +
               ' rx='    + (raw.framesRx  != null ? raw.framesRx  : '?') +
+              ' jbe='   + (raw.jbe   != null ? raw.jbe   : '?') +
               ' dec='   + (raw.framesDec != null ? raw.framesDec : '?') +
               ' kf='    + (raw.kf || 0) +
               (raw.impl ? ' impl=' + raw.impl : ''));
