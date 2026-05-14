@@ -73,7 +73,9 @@
               result = result.replace(plid, '42e01f');
               console.log('[sdp-patch] PT=' + pt + ' ' + pname + '(' + plid + ') → CBP(42e01f)');
             }
-            if (!result.includes('sps-pps-idr-in-keyframe')) {
+            // Only inject into answer SDPs — that's what tells the robot to embed SPS/PPS.
+            // Modifying remote (robot's offer) SDP is pointless and noisy.
+            if (isAnswer && !result.includes('sps-pps-idr-in-keyframe')) {
               result += ';sps-pps-idr-in-keyframe=1';
               console.log('[sdp-patch] PT=' + pt + ' +sps-pps-idr-in-keyframe');
             }
@@ -497,6 +499,17 @@
         log('user-unpublished uid=' + user.uid + ' ' + mediaType);
       });
       rtcClient.on('user-left', (user, reason) => log('user-left uid=' + user.uid + ' ' + reason));
+
+      // Enable Agora Cloud Proxy (mode 3 = UDP relay) before joining.
+      // Direct Agora edge WebSocket connections (wss://*.edge.agora.io:47xx) often fail
+      // inside Docker containers or on restricted networks. Cloud proxy routes all
+      // signaling and media through Agora's proxy infrastructure on reachable endpoints.
+      try {
+        rtcClient.startProxyServer(3);
+        log('[agora] cloud proxy mode 3 enabled');
+      } catch (e) {
+        log('[agora] cloud proxy error: ' + (e && e.message || String(e)));
+      }
 
       const rtcUid = await rtcClient.join(
         cfg.app_id, cfg.channel, cfg.token,
