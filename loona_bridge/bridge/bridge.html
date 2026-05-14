@@ -73,11 +73,15 @@
               result = result.replace(plid, '42e01f');
               console.log('[sdp-patch] PT=' + pt + ' ' + pname + '(' + plid + ') → CBP(42e01f)');
             }
-            // sps-pps-idr-in-keyframe=1 intentionally NOT injected here.
-            // When present in setLocalDescription, Firefox 128's H264 depacketizer
-            // appears to wait for inline SPS+PPS in every IDR before assembling frames.
-            // The Agora edge does NOT send inline SPS+PPS → framesReceived stays 0.
-            // Removing this parameter lets the jitter buffer assemble frames normally.
+            // Inject sps-pps-idr-in-keyframe=1 into H264 answer fmtp.
+            // REQUIRED: without this, Agora edge mutes the video track entirely
+            // (trk.muted=true, no inbound-rtp entry, bytes=0).
+            // The robot adds sps-pps-idr-in-keyframe=1 to its OWN offer when it
+            // starts publishing; echoing it back in our answer unlocks RTP delivery.
+            if (isAnswer && !result.includes('sps-pps-idr-in-keyframe')) {
+              result += ';sps-pps-idr-in-keyframe=1';
+              console.log('[sdp-patch] PT=' + pt + ' +sps-pps-idr-in-keyframe');
+            }
             return result;
           }
         );
@@ -421,6 +425,47 @@
           log('[video] remoteTrack.play() OK');
         } catch (e) {
           log('[video] remoteTrack.play() error: ' + e.message);
+        }
+
+        // Frame-counter RTCRtpScriptTransform:
+        // If [xform] frame#N logs appear → jitter buffer IS assembling H264 frames
+        //   from RTP (depacketizer works) but GMP decoder fails → different issue.
+        // If NO [xform] frame#N → jitter buffer never assembles frames → depacketizer
+        //   bug (sps-pps-idr-in-keyframe or FU-A handling issue in Firefox 128).
+        try {
+          if (typeof RTCRtpScriptTransform !== 'undefined') {
+            const _pc = findPC(rtcClient, 0);
+            const _vrecv = _pc && _pc.getReceivers &&
+              _pc.getReceivers().find(r => r.track && r.track.kind === 'video');
+            if (_vrecv) {
+              const _wSrc = `
+                let n = 0;
+                onrtctransform = ({transformer}) => {
+                  const rd = transformer.readable.getReader();
+                  const wr = transformer.writable.getWriter();
+                  (function pump() {
+                    rd.read().then(({done, value}) => {
+                      if (done) return;
+                      n++;
+                      if (n <= 5 || n % 60 === 0)
+                        self.postMessage('frame#' + n + ' type=' + value.type +
+                          ' sz=' + (value.data ? value.data.byteLength : 0));
+                      wr.write(value).then(pump);
+                    }).catch(e => self.postMessage('xform-err ' + e));
+                  })();
+                };`;
+              const _w = new Worker(URL.createObjectURL(new Blob([_wSrc], {type:'text/javascript'})));
+              _w.onmessage = ({data}) => log('[xform] ' + data);
+              _vrecv.transform = new RTCRtpScriptTransform(_w);
+              log('[xform] frame-counter installed on video receiver');
+            } else {
+              log('[xform] no video receiver found in PC');
+            }
+          } else {
+            log('[xform] RTCRtpScriptTransform not available in this Firefox');
+          }
+        } catch (e) {
+          log('[xform] setup error: ' + e.message);
         }
 
         // Wait up to 10 s for Agora's <video> to have decoded dimensions.
