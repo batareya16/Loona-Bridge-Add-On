@@ -5,10 +5,14 @@
  * frames over WebSocket to the Python receiver.
  *
  * Why Firefox instead of Chromium:
- *   Firefox decodes H.264 WebRTC via its bundled libavcodec on all platforms
- *   including ARM64 Linux — no proprietary codec package needed.
+ *   Firefox decodes H.264 WebRTC via OpenH264 GMP (Cisco, freely distributable) on
+ *   all platforms including ARM64 Linux — no proprietary system codec package needed.
  *   Chromium on ARM64 Linux has no usable H.264 WebRTC support in 2026
  *   (chromium-codecs-ffmpeg-extra is stuck at v126, Chromium is v147 — ABI mismatch).
+ *
+ * OpenH264 GMP: Firefox downloads it from Mozilla CDN on first run (~1 MB).
+ *   A persistent profile (/opt/ff-profile) caches it between bridge restarts.
+ *   The Dockerfile pre-warms the profile so it is baked into the image.
  *
  * Configuration via LOONA_BRIDGE_CONFIG env var (a JSON blob).
  * Required keys:
@@ -29,6 +33,9 @@ const { firefox } = require('playwright');
 const http = require('http');
 const path = require('path');
 const fs   = require('fs');
+
+// Persistent Firefox profile — preserves downloaded OpenH264 GMP between restarts.
+const PROFILE_DIR = process.env.FIREFOX_PROFILE_DIR || '/opt/ff-profile';
 
 function findSdkFile(pkgName, candidates) {
   let pkgRoot;
@@ -52,7 +59,7 @@ function findSdkFile(pkgName, candidates) {
       if (/^Agora.*\.js$/i.test(f)) return path.join(pkgRoot, f);
     }
   } catch (e) {}
-  // Also scan browser/ subdirectory (agora-rtm-sdk 1.5.x puts bundle there)
+  // Scan browser/ subdirectory (agora-rtm-sdk 1.5.x puts its bundle there)
   try {
     const browserDir = path.join(pkgRoot, 'browser');
     const files = fs.readdirSync(browserDir);
@@ -99,11 +106,11 @@ function findSdkFile(pkgName, candidates) {
   }
   console.error('[bridge] RTC SDK: ' + rtcPath);
   console.error('[bridge] RTM SDK: ' + rtmPath);
-  console.error('[bridge] Browser: Playwright Firefox (built-in H.264 via libavcodec)');
+  console.error('[bridge] Browser: Playwright Firefox + OpenH264 GMP (WebRTC H.264)');
 
-  // Serve bridge.html via a local HTTP server so Firefox gets an http:// origin.
-  // file:// pages in Firefox cannot make WebSocket connections to non-localhost
-  // hosts (e.g. ws://homeassistant:PORT) — the http:// origin has no such limit.
+  // Serve bridge.html via a local HTTP server so the page gets an http:// origin.
+  // file:// pages in Firefox cannot connect via WebSocket to non-localhost hosts
+  // (e.g. ws://homeassistant:PORT); an http:// origin has no such restriction.
   const htmlPath = path.resolve(__dirname, 'bridge.html');
   if (!fs.existsSync(htmlPath)) {
     console.error('bridge.html not found at ' + htmlPath);
@@ -120,38 +127,48 @@ function findSdkFile(pkgName, candidates) {
   });
   console.error('[bridge] HTML server: http://127.0.0.1:' + httpPort + '/');
 
-  // Launch Firefox.
-  // H.264 WebRTC decode is handled by Firefox's bundled libavcodec — no GMP/OpenH264
-  // download needed. OpenH264 GMP is for encoding only; we only receive video.
-  const browser = await firefox.launch({
+  // Ensure profile directory exists.
+  fs.mkdirSync(PROFILE_DIR, { recursive: true });
+
+  // Remove Firefox lock files left by a previously crashed instance.
+  // Without this, Firefox refuses to open an already-locked profile.
+  for (const lock of ['lock', 'parent.lock', '.parentlock']) {
+    try { fs.unlinkSync(path.join(PROFILE_DIR, lock)); } catch (e) {}
+  }
+
+  // Check if OpenH264 GMP is already in the profile (pre-warmed during build).
+  const gmpDir = path.join(PROFILE_DIR, 'gmp-gmpopenh264');
+  const hasGmp = fs.existsSync(gmpDir);
+  console.error('[bridge] OpenH264 GMP in profile: ' + (hasGmp ? 'YES ✓' : 'NO — will download on first run'));
+
+  // Launch Firefox with a PERSISTENT profile.
+  // launchPersistentContext reuses PROFILE_DIR between runs, so the OpenH264
+  // GMP download (triggered by media.gmp-gmpopenh264.enabled=true) is preserved.
+  const context = await firefox.launchPersistentContext(PROFILE_DIR, {
     headless: true,
     firefoxUserPrefs: {
       // Allow autoplay without user gesture.
-      'media.autoplay.default':           0,
-      'media.autoplay.blocking_policy':   0,
+      'media.autoplay.default':             0,
+      'media.autoplay.blocking_policy':     0,
       // Allow WebRTC without permission prompts.
       'media.navigator.permission.disabled': true,
-      'media.navigator.streams.fake':     false,
-      // Disable GMP auto-download (we don't need OpenH264 — only receiving H.264,
-      // not encoding; Firefox's built-in decoder handles it).
-      'media.gmp-gmpopenh264.enabled':    false,
-      'media.gmp-gmpopenh264.autoupdate': false,
-      // Disable telemetry/update checks to speed up startup.
-      'app.update.enabled':               false,
-      'toolkit.telemetry.enabled':        false,
+      'media.navigator.streams.fake':        false,
+      // OpenH264 GMP — required for WebRTC H.264 encode AND decode in Firefox.
+      // Firefox downloads ~1 MB from Mozilla CDN on first run; cached in profile.
+      'media.gmp-gmpopenh264.enabled':       true,
+      'media.gmp-gmpopenh264.autoupdate':    true,
+      // Disable background services that slow startup.
+      'app.update.enabled':                  false,
+      'toolkit.telemetry.enabled':           false,
       'datareporting.healthreport.service.enabled': false,
     },
   });
 
-  console.error('[bridge] Firefox launched');
+  console.error('[bridge] Firefox launched (persistent profile: ' + PROFILE_DIR + ')');
 
-  // Firefox permissions are handled via firefoxUserPrefs above
-  // (media.navigator.permission.disabled = true).
-  // Playwright's newContext permissions API is Chromium-only — not supported in Firefox.
-  const context = await browser.newContext();
   const page = await context.newPage();
 
-  // Disable all timeouts — startAgora can legitimately take >30 s on slow networks.
+  // No timeout — startAgora runs indefinitely.
   page.setDefaultTimeout(0);
   page.setDefaultNavigationTimeout(0);
 
@@ -159,7 +176,6 @@ function findSdkFile(pkgName, candidates) {
   page.on('pageerror', (err) => console.error('[bridge js ERROR] ' + err.message));
 
   await page.goto('http://127.0.0.1:' + httpPort + '/', { waitUntil: 'load' });
-  // HTML is loaded — HTTP server no longer needed.
   httpServer.close();
 
   // Inject the SDK bundles directly.
@@ -177,16 +193,14 @@ function findSdkFile(pkgName, candidates) {
     process.exit(3);
   }
 
-  // startAgora sets up event handlers and runs indefinitely (WebSocket, Agora RTC/RTM).
-  // We do not await its return — just fire it and let the page run.
-  // Errors surface via page.on('pageerror') and page.on('console').
+  // Fire-and-forget: startAgora sets up event handlers and runs indefinitely.
   page.evaluate(cfg => window.startAgora(cfg), cfg).catch((err) => {
     console.error('[bridge] startAgora error: ' + (err && err.message || String(err)));
   });
   console.error('[bridge] page started, streaming...');
 
   const shutdown = async () => {
-    try { await browser.close(); } catch (e) {}
+    try { await context.close(); } catch (e) {}
     process.exit(0);
   };
   process.on('SIGINT',  shutdown);
