@@ -282,40 +282,55 @@ function findSdkFile(pkgName, candidates) {
       Object.defineProperty(document, 'hidden',          { get: () => false,      configurable: true });
       document.dispatchEvent(new Event('visibilitychange'));
     } catch (e) {}
-    // Patch AudioContext to auto-resume — covers Agora's internal context too.
-    // Agora SDK v4.24+ checks audioContext.currentTime after ~3 s; if it's still
-    // 0 it logs "AudioContext current time stuck at 0" and freezes its jitter-
-    // buffer scheduler, causing framesDecoded to stay 0 forever.
+    // Agora SDK v4.24+ uses AudioContext.currentTime as its jitter-buffer clock.
+    // In headless Firefox inside Docker (no audio device), the AudioContext cannot
+    // be resumed — ctx.state stays 'suspended' and currentTime stays 0 forever.
+    // Agora detects this after ~10 s ("AudioContext current time stuck at 0") and
+    // freezes its video decode scheduler → framesDecoded=0 forever.
     //
-    // Three unlock mechanisms are combined:
-    //  1. ctx.resume()                    — standard promise-based resume
-    //  2. Silent 1-sample BufferSource    — triggers audio subsystem activity
-    //  3. Retry timers (100/500/2000 ms)  — catches deferred-resume cases in Firefox
+    // Fix A (prototype patch): Override AudioContext.prototype.currentTime.
+    //   When the native getter returns 0 (context suspended), return a synthetic
+    //   monotonically-increasing time from performance.now() instead.
+    //   Agora's scheduler sees advancing time and proceeds with jitter-buffer emit.
+    //
+    // Fix B (constructor patch): Still attempt ctx.resume() + silent BufferSource
+    //   so we use the real clock if the audio backend eventually becomes available.
     try {
       const OrigAC = window.AudioContext || window.webkitAudioContext;
       if (OrigAC) {
-        function unlockCtx(ctx) {
-          if (ctx.state === 'running') return;
-          ctx.resume().catch(() => {});
-          try {
-            // A silent 1-sample buffer played to destination forces Firefox's
-            // audio subsystem to activate the context immediately.
-            const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
-            const src = ctx.createBufferSource();
-            src.buffer = buf;
-            src.connect(ctx.destination);
-            src.start(0);
-          } catch (e) {}
+        // A: prototype currentTime override (applies to ALL AudioContext instances,
+        //    including the one Agora creates internally).
+        const origDesc = Object.getOwnPropertyDescriptor(OrigAC.prototype, 'currentTime');
+        if (origDesc && origDesc.get) {
+          Object.defineProperty(OrigAC.prototype, 'currentTime', {
+            get() {
+              const real = origDesc.get.call(this);
+              if (real > 0) return real;                  // context running — use real clock
+              if (!this._synthOrigin) this._synthOrigin = performance.now();
+              return (performance.now() - this._synthOrigin) / 1000;  // synthetic
+            },
+            configurable: true,
+          });
+          console.log('[bridge-init] AudioContext.currentTime synthetic-time patch applied');
         }
+
+        // B: constructor patch — still try real resume (harmless if no audio device).
         function PatchedAC(...args) {
           const ctx = new OrigAC(...args);
-          unlockCtx(ctx);
-          ctx.addEventListener('statechange', () => unlockCtx(ctx));
-          document.addEventListener('visibilitychange', () => unlockCtx(ctx));
-          // Retry in case the initial unlock races with Firefox's audio init.
-          setTimeout(() => unlockCtx(ctx), 100);
-          setTimeout(() => unlockCtx(ctx), 500);
-          setTimeout(() => unlockCtx(ctx), 2000);
+          const tryResume = () => {
+            if (ctx.state === 'running') return;
+            ctx.resume().catch(() => {});
+            try {
+              const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
+              const src = ctx.createBufferSource();
+              src.buffer = buf; src.connect(ctx.destination); src.start(0);
+            } catch (_) {}
+          };
+          tryResume();
+          ctx.addEventListener('statechange', tryResume);
+          document.addEventListener('visibilitychange', tryResume);
+          setTimeout(tryResume, 200);
+          setTimeout(tryResume, 1000);
           return ctx;
         }
         PatchedAC.prototype = OrigAC.prototype;

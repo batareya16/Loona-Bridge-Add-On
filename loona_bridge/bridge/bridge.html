@@ -391,15 +391,22 @@
       let broadwayActive = false;
 
       rtcClient.on('user-published', async (user, mediaType) => {
-        await rtcClient.subscribe(user, mediaType);
-        log('subscribed uid=' + user.uid + ' ' + mediaType);
         if (mediaType === 'audio') {
-          if (user.audioTrack) {
-            try { user.audioTrack.setVolume(0); } catch (e) {}
-          }
+          // Skip audio subscription intentionally.
+          // Subscribing to audio causes Agora to call `new AudioContext()`.
+          // In headless Firefox inside Docker (no audio device), the context
+          // stays suspended → currentTime=0 → Agora warns "stuck at 0" and
+          // freezes its video jitter-buffer scheduler → framesDecoded stays 0.
+          // We only need video frames; audio is unused.
+          // The AudioContext.prototype.currentTime synthetic-time patch in
+          // bridge.js is a belt-and-suspenders fix if Agora creates a context
+          // for any other reason.
+          log('[audio] skip subscription (headless Docker — no audio device)');
           return;
         }
         if (mediaType !== 'video') return;
+        await rtcClient.subscribe(user, mediaType);
+        log('subscribed uid=' + user.uid + ' ' + mediaType);
         if (broadwayActive) {
           log('[video] already running — resubscribe complete, new IDR expected');
           return;
