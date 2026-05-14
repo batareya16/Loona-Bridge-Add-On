@@ -353,21 +353,9 @@
         log('[webcodecs] VideoDecoder API absent — Agora will use browser GMP path');
       }
 
-      // Try to force Agora SDK to use the browser-native WebRTC decode pipeline
-      // instead of its WebCodecs path.  Parameter names vary by SDK version;
-      // try all known variants silently.
-      for (const [k, v] of [
-        ['ENABLE_WEBCODECS_FOR_H264',    false],
-        ['ENABLE_H264_WEBCODECS',        false],
-        ['DISABLE_WEBCODECS',            true],
-        ['WEBCODECS_ENABLED',            false],
-        ['USE_WEBCODECS_DECODE',         false],
-      ]) {
-        try {
-          AgoraRTC.setParameter(k, v);
-          log('[agora-param] ' + k + '=' + v);
-        } catch (_) {}
-      }
+      // NOTE: setParameter('DISABLE_WEBCODECS', true) and similar were tried but
+      // caused Agora v4.24 to lose its video RTCPeerConnection entirely, making
+      // bytesReceived=0 and no inbound-rtp stats.  Removed — do not add back.
 
       // 2d) Join the Agora RTC channel.
       // Match the robot's Android Agora SDK config: mode='live' + role='host'.

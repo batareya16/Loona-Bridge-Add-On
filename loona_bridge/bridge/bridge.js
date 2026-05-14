@@ -216,6 +216,11 @@ function findSdkFile(pkgName, candidates) {
       // Allow autoplay without user gesture.
       'media.autoplay.default':             0,
       'media.autoplay.blocking_policy':     0,
+      // In headless Firefox, tabs never become "foreground" in the OS sense.
+      // Without this pref, Firefox keeps AudioContext suspended even when
+      // media.autoplay.default=0, causing Agora to warn
+      // "AudioContext current time stuck at 0" and freeze its media pipeline.
+      'media.block-autoplay-until-in-foreground': false,
       // Allow WebRTC without permission prompts.
       'media.navigator.permission.disabled': true,
       'media.navigator.streams.fake':        false,
@@ -277,19 +282,40 @@ function findSdkFile(pkgName, candidates) {
       Object.defineProperty(document, 'hidden',          { get: () => false,      configurable: true });
       document.dispatchEvent(new Event('visibilitychange'));
     } catch (e) {}
-    // Pre-create an AudioContext and keep it alive with a silent gain node.
-    // Agora SDK creates its own AudioContext; if that context is suspended on
-    // creation, audio (and video) playback never starts.
-    // Patching AudioContext to auto-resume covers Agora's internal context too.
+    // Patch AudioContext to auto-resume — covers Agora's internal context too.
+    // Agora SDK v4.24+ checks audioContext.currentTime after ~3 s; if it's still
+    // 0 it logs "AudioContext current time stuck at 0" and freezes its jitter-
+    // buffer scheduler, causing framesDecoded to stay 0 forever.
+    //
+    // Three unlock mechanisms are combined:
+    //  1. ctx.resume()                    — standard promise-based resume
+    //  2. Silent 1-sample BufferSource    — triggers audio subsystem activity
+    //  3. Retry timers (100/500/2000 ms)  — catches deferred-resume cases in Firefox
     try {
       const OrigAC = window.AudioContext || window.webkitAudioContext;
       if (OrigAC) {
+        function unlockCtx(ctx) {
+          if (ctx.state === 'running') return;
+          ctx.resume().catch(() => {});
+          try {
+            // A silent 1-sample buffer played to destination forces Firefox's
+            // audio subsystem to activate the context immediately.
+            const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
+            const src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(ctx.destination);
+            src.start(0);
+          } catch (e) {}
+        }
         function PatchedAC(...args) {
           const ctx = new OrigAC(...args);
-          const resume = () => ctx.state !== 'running' && ctx.resume().catch(() => {});
-          resume();
-          ctx.addEventListener('statechange', resume);
-          document.addEventListener('visibilitychange', resume);
+          unlockCtx(ctx);
+          ctx.addEventListener('statechange', () => unlockCtx(ctx));
+          document.addEventListener('visibilitychange', () => unlockCtx(ctx));
+          // Retry in case the initial unlock races with Firefox's audio init.
+          setTimeout(() => unlockCtx(ctx), 100);
+          setTimeout(() => unlockCtx(ctx), 500);
+          setTimeout(() => unlockCtx(ctx), 2000);
           return ctx;
         }
         PatchedAC.prototype = OrigAC.prototype;
