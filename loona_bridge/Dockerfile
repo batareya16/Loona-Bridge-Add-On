@@ -38,8 +38,8 @@ RUN npm install --omit=dev \
 #    than about:blank which doesn't request codec support).
 #    Falls back gracefully if CDN unreachable — bridge.html waitForH264Codec()
 #    handles the runtime fallback.
-COPY prewarm.js /tmp/prewarm.js
-RUN node /tmp/prewarm.js && rm /tmp/prewarm.js
+COPY prewarm.js ./prewarm.js
+RUN node prewarm.js && rm prewarm.js
 
 COPY bridge/ ./
 
