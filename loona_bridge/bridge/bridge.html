@@ -199,8 +199,10 @@
 
     /** Called from bridge.js (Playwright) after the page loads. */
     window.startAgora = async (cfg) => {
-      // Suppress Agora SDK verbose logs — show only WARNING and ERROR.
-      try { AgoraRTC.setLogLevel(3); } catch (_) {}
+      // Log level 1 = INFO — needed to see Agora's internal decoder selection path.
+      // (0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR, 4=NONE)
+      // Once decode issue is resolved, bump back to 3 (ERROR-only) to reduce noise.
+      try { AgoraRTC.setLogLevel(1); } catch (_) {}
       try { if (AgoraRTM.setLogLevel) AgoraRTM.setLogLevel(3); } catch (_) {}
 
       log('channel=' + (cfg.channel || '(stub)') + ' ws=' + cfg.ws_host + ':' + cfg.ws_port);
@@ -332,7 +334,42 @@
         log('[h264-caps] mediaCapabilities error: ' + e.message);
       }
 
-      // 2b) Join the Agora RTC channel.
+      // 2c) Check WebCodecs H.264 availability.
+      // Agora SDK v4.7+ uses VideoDecoder (WebCodecs) for H.264 instead of
+      // browser-native GMP.  On Firefox/ARM64 Linux, VideoDecoder may exist but
+      // H.264 has no hardware decoder → isConfigSupported returns {supported:false}
+      // → Agora's internal decoder init fails → RECV_VIDEO_DECODE_FAILED (code 1005).
+      if (typeof VideoDecoder !== 'undefined') {
+        try {
+          const wc = await VideoDecoder.isConfigSupported({
+            codec: 'avc1.42e01f', width: 640, height: 480
+          });
+          log('[webcodecs] VideoDecoder H264 supported=' + wc.supported +
+              (wc.config ? ' codec=' + wc.config.codec : ''));
+        } catch (e) {
+          log('[webcodecs] VideoDecoder.isConfigSupported: ' + e.message);
+        }
+      } else {
+        log('[webcodecs] VideoDecoder API absent — Agora will use browser GMP path');
+      }
+
+      // Try to force Agora SDK to use the browser-native WebRTC decode pipeline
+      // instead of its WebCodecs path.  Parameter names vary by SDK version;
+      // try all known variants silently.
+      for (const [k, v] of [
+        ['ENABLE_WEBCODECS_FOR_H264',    false],
+        ['ENABLE_H264_WEBCODECS',        false],
+        ['DISABLE_WEBCODECS',            true],
+        ['WEBCODECS_ENABLED',            false],
+        ['USE_WEBCODECS_DECODE',         false],
+      ]) {
+        try {
+          AgoraRTC.setParameter(k, v);
+          log('[agora-param] ' + k + '=' + v);
+        } catch (_) {}
+      }
+
+      // 2d) Join the Agora RTC channel.
       // Match the robot's Android Agora SDK config: mode='live' + role='host'.
       // When clients in the same channel use different `mode` settings, Agora
       // silently breaks data delivery (control plane works, but no RTP bytes
