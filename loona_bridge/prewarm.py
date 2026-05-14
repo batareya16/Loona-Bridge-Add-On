@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-Docker build pre-warm: directly download OpenH264 GMP from Mozilla CDN.
+Docker build pre-warm: download OpenH264 GMP and place it inside the Firefox
+BINARY directory so it is baked into the Docker image layer.
 
-1. Find the Playwright Firefox installation and read its version.
-2. Query Mozilla's GMP update server for the OpenH264 download URL.
-3. Download the ZIP and extract into /opt/ff-profile/gmp-gmpopenh264/{version}/.
+  {PLAYWRIGHT_BROWSERS_PATH}/firefox-*/firefox/gmp-gmpopenh264/{version}/
+    libgmpopenh264.so
+    gmpopenh264.info
 
-Firefox finds the GMP in the persistent profile directory at startup — no network
-request needed at runtime. If this script fails (no CDN access during build),
-bridge.html's waitForH264Codec() loop handles the runtime fallback.
+Firefox searches for GMP plugins in the directory containing the firefox binary
+in addition to the profile. By placing the plugin there (not in the profile),
+it survives container recreates — the profile (/opt/ff-profile) is a writable
+layer that resets, but the Firefox binary dir is part of the read-only image.
+
+If this script fails (no CDN access during build), bridge.html's
+waitForH264Codec() polls RTCPeerConnection.createOffer() and waits up to 120 s
+for Firefox to download the GMP at runtime (runtime fallback).
 """
 import sys, os, re, glob, platform, urllib.request, urllib.error, zipfile, io
 
 PLAYWRIGHT_PATH = os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '/opt/pw-browsers')
-PROFILE_DIR     = os.environ.get('FIREFOX_PROFILE_DIR',      '/opt/ff-profile')
 
 def log(msg):
     print('[prewarm] ' + msg, flush=True)
@@ -93,22 +98,47 @@ def main():
         return
     log(f'Downloaded {len(zip_data):,} bytes')
 
-    # Extract into profile
-    gmp_dir = os.path.join(PROFILE_DIR, 'gmp-gmpopenh264', h264_version)
+    # Extract into Firefox BINARY dir — survives container recreates (image layer).
+    # Profile dir (/opt/ff-profile) resets on rebuild; binary dir does not.
+    gmp_dir = os.path.join(ff_dir, 'gmp-gmpopenh264', h264_version)
     os.makedirs(gmp_dir, exist_ok=True)
     try:
         with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
             z.extractall(gmp_dir)
+        log(f'Extracted ZIP to {gmp_dir}: {", ".join(os.listdir(gmp_dir))}')
     except zipfile.BadZipFile:
-        # Some older builds use bzip2 .so.bz2 format
+        # Older/ARM builds may ship bzip2-compressed .so instead of ZIP
         import bz2
         so_data = bz2.decompress(zip_data)
-        with open(os.path.join(gmp_dir, 'libgmpopenh264.so'), 'wb') as f:
+        so_path = os.path.join(gmp_dir, 'libgmpopenh264.so')
+        with open(so_path, 'wb') as f:
             f.write(so_data)
+        # Firefox requires gmpopenh264.info alongside the .so
+        info_path = os.path.join(gmp_dir, 'gmpopenh264.info')
+        with open(info_path, 'w') as f:
+            f.write(f'Name=gmpopenh264\n'
+                    f'Description=OpenH264 Video Codec provided by Cisco Systems, Inc.\n'
+                    f'Version={h264_version}\n'
+                    f'Vendor=Cisco Systems, Inc.\n'
+                    f'ABI=gmpopenh264-ABI-1\n')
+        log(f'Extracted bz2 to {gmp_dir}: {", ".join(os.listdir(gmp_dir))}')
 
+    # Verify required files present
     files = os.listdir(gmp_dir)
-    log(f'Extracted to {gmp_dir}: {", ".join(files)}')
-    log('SUCCESS — OpenH264 baked into Docker image')
+    has_so   = any(f.endswith('.so') or f.endswith('.dll') or f.endswith('.dylib') for f in files)
+    has_info = any(f.endswith('.info') for f in files)
+    if not has_so:
+        log('WARNING: no .so found in ' + gmp_dir + ' — Firefox may not load GMP')
+    if not has_info:
+        log('WARNING: no .info found — creating minimal one')
+        with open(os.path.join(gmp_dir, 'gmpopenh264.info'), 'w') as f:
+            f.write(f'Name=gmpopenh264\n'
+                    f'Description=OpenH264 Video Codec provided by Cisco Systems, Inc.\n'
+                    f'Version={h264_version}\n'
+                    f'Vendor=Cisco Systems, Inc.\n'
+                    f'ABI=gmpopenh264-ABI-1\n')
+
+    log(f'SUCCESS — OpenH264 {h264_version} baked into Firefox binary dir: {gmp_dir}')
 
 try:
     main()

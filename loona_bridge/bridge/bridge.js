@@ -136,10 +136,26 @@ function findSdkFile(pkgName, candidates) {
     try { fs.unlinkSync(path.join(PROFILE_DIR, lock)); } catch (e) {}
   }
 
-  // Check if OpenH264 GMP is already in the profile (pre-warmed during build).
-  const gmpDir = path.join(PROFILE_DIR, 'gmp-gmpopenh264');
-  const hasGmp = fs.existsSync(gmpDir);
-  console.error('[bridge] OpenH264 GMP in profile: ' + (hasGmp ? 'YES ✓' : 'NO — will download on first run'));
+  // Check if OpenH264 GMP is pre-warmed in the Firefox binary dir (baked into image).
+  // prewarm.py places it at {PLAYWRIGHT_BROWSERS_PATH}/firefox-*/firefox/gmp-gmpopenh264/
+  const PW_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || '/opt/pw-browsers';
+  let hasGmp = false;
+  let gmpLocation = 'not found';
+  try {
+    const { execSync } = require('child_process');
+    const ffDirs = execSync(`find "${PW_PATH}" -maxdepth 3 -name firefox -type d 2>/dev/null`)
+      .toString().trim().split('\n').filter(Boolean);
+    for (const d of ffDirs) {
+      const g = path.join(d, 'gmp-gmpopenh264');
+      if (fs.existsSync(g)) { hasGmp = true; gmpLocation = g; break; }
+    }
+  } catch (e) {}
+  // Also check profile dir as fallback
+  if (!hasGmp && fs.existsSync(path.join(PROFILE_DIR, 'gmp-gmpopenh264'))) {
+    hasGmp = true;
+    gmpLocation = path.join(PROFILE_DIR, 'gmp-gmpopenh264') + ' (profile — may reset on rebuild!)';
+  }
+  console.error('[bridge] OpenH264 GMP: ' + (hasGmp ? 'YES ✓ at ' + gmpLocation : 'NO — will download on first run'));
 
   // Launch Firefox with a PERSISTENT profile.
   // launchPersistentContext reuses PROFILE_DIR between runs, so the OpenH264
