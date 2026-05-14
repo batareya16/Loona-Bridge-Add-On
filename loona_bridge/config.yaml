@@ -1,6 +1,6 @@
 ---
 name: Loona Agora Bridge
-version: "0.1.37"
+version: "0.1.38"
 slug: loona_bridge
 description: >
   Playwright/Firefox bridge для видео Loona через Agora RTC (H.264 via built-in libavcodec).
@@ -19,6 +19,11 @@ map:
 # to run without double-seccomp conflict on ARM64 Linux (otherwise libgmpopenh264
 # crashes on first H.264 bitstream → framesDecoded stays 0 forever).
 full_access: true
+# host_network: container shares Pi's network stack directly.
+# Without this, Firefox inside Docker sees only the Docker bridge IP (172.17.x.x)
+# and puts that as ICE candidate → Agora edge server cannot route to it → bytes=0.
+# With host_network the real Pi IP appears in ICE candidates → stable WebRTC UDP.
+host_network: true
 options:
   fps: 10
   jpeg_quality: 0.65
