@@ -309,6 +309,21 @@
         }
       })();
 
+      // 2b-pre) Probe actual H.264 decode capability via mediaCapabilities API.
+      // This is a REAL decode test (not just SDP negotiation) — if supported=false,
+      // the GMP is not functional even though H.264 appears in createOffer().
+      try {
+        const cap = await navigator.mediaCapabilities.decodingInfo({
+          type: 'media-source',
+          video: { contentType: 'video/mp4; codecs="avc1.42e01f"',
+                   width: 1280, height: 720, bitrate: 2000000, framerate: 15 }
+        });
+        log('[h264-caps] supported=' + cap.supported + ' smooth=' + cap.smooth +
+            ' powerEff=' + cap.powerEfficient);
+      } catch (e) {
+        log('[h264-caps] mediaCapabilities error: ' + e.message);
+      }
+
       // 2b) Join the Agora RTC channel.
       // Match the robot's Android Agora SDK config: mode='live' + role='host'.
       // When clients in the same channel use different `mode` settings, Agora
@@ -377,10 +392,13 @@
           log('[video] ✗ no decoded video after 10 s — H.264/GMP not working');
           const v = container.querySelector('video');
           if (v) {
+            const tracks = v.srcObject ? v.srcObject.getTracks() : [];
+            const trk = tracks[0];
             log('[video-dbg] readyState=' + v.readyState +
                 ' paused=' + v.paused +
-                ' err=' + (v.error ? v.error.code + '/' + v.error.message : 'null') +
-                ' srcObj=' + (v.srcObject ? 'tracks=' + v.srcObject.getTracks().length : 'null'));
+                ' err=' + (v.error ? v.error.code : 'null') +
+                ' srcObj=tracks=' + tracks.length +
+                (trk ? (' trk.state=' + trk.readyState + ' trk.muted=' + trk.muted) : ''));
           } else {
             log('[video-dbg] no <video> in container');
           }

@@ -1,6 +1,6 @@
 ---
 name: Loona Agora Bridge
-version: "0.1.33"
+version: "0.1.34"
 slug: loona_bridge
 description: >
   Playwright/Firefox bridge для видео Loona через Agora RTC (H.264 via built-in libavcodec).
@@ -15,6 +15,10 @@ map:
   - type: homeassistant_config
     read_only: true
     path: /ha_config
+# full_access removes Docker seccomp + AppArmor → allows Firefox GMP child process
+# to run without double-seccomp conflict on ARM64 Linux (otherwise libgmpopenh264
+# crashes on first H.264 bitstream → framesDecoded stays 0 forever).
+full_access: true
 options:
   fps: 10
   jpeg_quality: 0.65
