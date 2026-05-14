@@ -375,6 +375,15 @@
           log('[video] ✓ <video> ready: ' + videoEl.videoWidth + 'x' + videoEl.videoHeight);
         } else {
           log('[video] ✗ no decoded video after 10 s — H.264/GMP not working');
+          const v = container.querySelector('video');
+          if (v) {
+            log('[video-dbg] readyState=' + v.readyState +
+                ' paused=' + v.paused +
+                ' err=' + (v.error ? v.error.code + '/' + v.error.message : 'null') +
+                ' srcObj=' + (v.srcObject ? 'tracks=' + v.srcObject.getTracks().length : 'null'));
+          } else {
+            log('[video-dbg] no <video> in container');
+          }
         }
 
         // ── Periodic stats ────────────────────────────────────────────────────
@@ -402,14 +411,17 @@
               report.forEach((r) => {
                 if (r.type === 'inbound-rtp' && r.kind === 'video')
                   raw = {bytes: r.bytesReceived, framesRx: r.framesReceived,
-                         framesDec: r.framesDecoded, kf: r.keyFramesDecoded};
+                         framesDec: r.framesDecoded, kf: r.keyFramesDecoded,
+                         impl: r.decoderImplementation};
               });
             }
           } catch (_) {}
           log('[stats] cap=' + capturedFrames +
               ' bytes=' + (raw.bytes || 0) +
+              ' rx='    + (raw.framesRx  != null ? raw.framesRx  : '?') +
               ' dec='   + (raw.framesDec != null ? raw.framesDec : '?') +
-              ' kf='    + (raw.kf || 0));
+              ' kf='    + (raw.kf || 0) +
+              (raw.impl ? ' impl=' + raw.impl : ''));
         }, 15000);
 
         // ── Canvas capture loop ───────────────────────────────────────────────

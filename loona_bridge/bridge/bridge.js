@@ -199,6 +199,11 @@ function findSdkFile(pkgName, candidates) {
   const launchEnv = {
     ...process.env,
     MOZ_DISABLE_CONTENT_SANDBOX: '1',
+    // Also disable the GMP child-process sandbox (separate from content sandbox).
+    // On ARM64 Linux inside Docker (restricted seccomp), Firefox's own seccomp
+    // layer on the gmplugin process double-stacks with Docker's policy and causes
+    // libgmpopenh264.so to crash → framesDecoded stays 0.
+    MOZ_DISABLE_GMP_SANDBOX: '1',
   };
 
   const context = await firefox.launchPersistentContext(PROFILE_DIR, {
