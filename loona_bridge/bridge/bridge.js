@@ -190,8 +190,24 @@ function findSdkFile(pkgName, candidates) {
   // launchPersistentContext reuses PROFILE_DIR between runs.
   // autoupdate is set FALSE to prevent Firefox from evicting the pre-warmed GMP
   // by trying to fetch a newer version from a CDN that may be unreachable at runtime.
+  // MOZ_DISABLE_CONTENT_SANDBOX=1 is the reliable way to disable the GMP
+  // sandbox on Linux.  The pref security.sandbox.content.level=0 is also set
+  // below but Playwright may not honour it for the GMP child process; the env
+  // var always wins.  Without this, libgmpopenh264.so crashes inside Docker's
+  // restricted seccomp → Agora gets a hard decode error → stops the RTP stream
+  // entirely (raw.bytes=0, framesRx=?).
+  const launchEnv = {
+    ...process.env,
+    MOZ_DISABLE_CONTENT_SANDBOX: '1',
+  };
+
   const context = await firefox.launchPersistentContext(PROFILE_DIR, {
     headless: true,
+    env: launchEnv,
+    // Provide a real viewport so Firefox doesn't treat the page as "background".
+    // Without this, headless Firefox can suspend <video> elements and freeze
+    // AudioContext (current time stuck at 0) before any frames arrive.
+    viewport: { width: 1280, height: 720 },
     firefoxUserPrefs: {
       // Allow autoplay without user gesture.
       'media.autoplay.default':             0,
@@ -245,6 +261,41 @@ function findSdkFile(pkgName, candidates) {
 
   await page.goto('http://127.0.0.1:' + httpPort + '/', { waitUntil: 'load' });
   httpServer.close();
+
+  // Override visibility API — headless Firefox reports page as "hidden", which
+  // causes <video> elements to immediately suspend (Agora: "waiting => suspend")
+  // and freezes AudioContext (currentTime stuck at 0).
+  // Both kill the video pipeline before any RTP frames arrive.
+  await page.evaluate(() => {
+    // Make the page appear visible and focused at all times.
+    try {
+      Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+      Object.defineProperty(document, 'hidden',          { get: () => false,      configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    } catch (e) {}
+    // Pre-create an AudioContext and keep it alive with a silent gain node.
+    // Agora SDK creates its own AudioContext; if that context is suspended on
+    // creation, audio (and video) playback never starts.
+    // Patching AudioContext to auto-resume covers Agora's internal context too.
+    try {
+      const OrigAC = window.AudioContext || window.webkitAudioContext;
+      if (OrigAC) {
+        function PatchedAC(...args) {
+          const ctx = new OrigAC(...args);
+          const resume = () => ctx.state !== 'running' && ctx.resume().catch(() => {});
+          resume();
+          ctx.addEventListener('statechange', resume);
+          document.addEventListener('visibilitychange', resume);
+          return ctx;
+        }
+        PatchedAC.prototype = OrigAC.prototype;
+        Object.setPrototypeOf(PatchedAC, OrigAC);
+        window.AudioContext = PatchedAC;
+        if (window.webkitAudioContext) window.webkitAudioContext = PatchedAC;
+      }
+    } catch (e) {}
+    console.log('[bridge-init] visibility override + AudioContext patch applied');
+  });
 
   // Inject the SDK bundles directly.
   await page.addScriptTag({ path: rtcPath });

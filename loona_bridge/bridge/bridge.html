@@ -99,8 +99,16 @@
         };
       }
       wrapSetDesc(RTCPeerConnection.prototype, 'setLocalDescription');
-      wrapSetDesc(RTCPeerConnection.prototype, 'setRemoteDescription');
-      console.log('[sdp-patch] createAnswer + setLocal + setRemoteDescription patched for H.264 sps-pps-idr-in-keyframe');
+      // setRemoteDescription: no logging needed (remote SDP is from robot, we only care about local answer)
+      const origSetRemoteDesc = RTCPeerConnection.prototype.setRemoteDescription;
+      RTCPeerConnection.prototype.setRemoteDescription = function(init) {
+        if (init && init.sdp) {
+          const patched = injectSpsParam(init.sdp);
+          if (patched !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: patched });
+        }
+        return origSetRemoteDesc.apply(this, arguments);
+      };
+      console.log('[sdp-patch] installed');
     })();
   </script>
   <style>
@@ -167,8 +175,11 @@
 
     /** Called from bridge.js (Playwright) after the page loads. */
     window.startAgora = async (cfg) => {
-      log('config: ' + JSON.stringify({...cfg, token: cfg.token?.slice(0, 12) + '...',
-                                            rtm_token: cfg.rtm_token?.slice(0, 12) + '...'}));
+      // Suppress Agora SDK verbose logs — show only WARNING and ERROR.
+      try { AgoraRTC.setLogLevel(3); } catch (_) {}
+      try { if (AgoraRTM.setLogLevel) AgoraRTM.setLogLevel(3); } catch (_) {}
+
+      log('channel=' + (cfg.channel || '(stub)') + ' ws=' + cfg.ws_host + ':' + cfg.ws_port);
 
       // 1) Open WS to the Python receiver — bridge.js sets cfg.ws_port.
       // ws_host defaults to 127.0.0.1 (subprocess mode inside HA container) but
@@ -209,20 +220,15 @@
           log('ws open');
           if (_wsResolve) { _wsResolve(); _wsResolve = null; }
         };
-        ws.onerror = () => log('ws error');
+        ws.onerror = () => {};
         ws.onclose = () => {
           if (wsEverOpened) {
             wsConsecutiveFails++;
-            log('ws closed — retry in 3 s (' + wsConsecutiveFails + '/' + WS_MAX_FAILS + ')');
+            if (wsConsecutiveFails === 1) log('ws closed — retrying...');
             if (wsConsecutiveFails >= WS_MAX_FAILS) {
-              // Python server stopped listening on this port (probably restarted on a
-              // new port written to bridge-config.json).  Signal bridge.js to exit so
-              // run.sh can restart with the fresh config.
-              log('[FATAL] ws unreachable for ' + (WS_MAX_FAILS * 3) + ' s — Python restarted? Requesting bridge restart.');
-              return;  // do NOT call setTimeout(openWs) — let bridge.js exit
+              log('[FATAL] ws unreachable for ' + (WS_MAX_FAILS * 3) + ' s — Python restarted?');
+              return;
             }
-          } else {
-            log('ws closed (not yet opened) — retry in 3 s');
           }
           setTimeout(openWs, 3000);
         };
@@ -263,7 +269,6 @@
       // that silently delivers nothing.
       await (async function waitForH264Codec() {
         const POLL_MS = 2000;
-        log('[h264-wait] checking WebRTC H.264 availability (OpenH264 GMP)...');
         let attempt = 0;
         while (true) {
           let hasH264 = false;
@@ -277,12 +282,13 @@
             log('[h264-wait] createOffer error: ' + e.message);
           }
           if (hasH264) {
-            log('[h264-wait] ✓ H.264 codec available (attempt ' + (attempt + 1) + ') — starting Agora');
+            log('[h264-wait] ✓ H.264 ready' + (attempt ? ' (waited ' + Math.round(attempt*POLL_MS/1000) + 's)' : ''));
             return;
           }
           attempt++;
-          const elapsed = Math.round(attempt * POLL_MS / 1000);
-          log('[h264-wait] H.264 not yet available — ' + elapsed + 's elapsed, retrying...');
+          // Log only every 15 attempts (~30 s) to avoid spam
+          if (attempt === 1 || attempt % 15 === 0)
+            log('[h264-wait] waiting for GMP... ' + Math.round(attempt*POLL_MS/1000) + 's');
           await new Promise(r => setTimeout(r, POLL_MS));
         }
       })();
@@ -296,7 +302,6 @@
       const rtcMode  = cfg.rtc_mode || 'live';
       const rtcRole  = cfg.role     || 'host';
       const rtcCodec = cfg.codec    || 'h264';
-      log('RTC config: mode=' + rtcMode + ' role=' + rtcRole + ' codec=' + rtcCodec);
       const rtcClient = AgoraRTC.createClient({mode: rtcMode, codec: rtcCodec, role: rtcRole});
 
       // Guard: Broadway pipeline is set up only once per video session.
@@ -305,12 +310,8 @@
       let broadwayActive = false;
 
       rtcClient.on('user-published', async (user, mediaType) => {
-        log('user-published uid=' + user.uid + ' kind=' + mediaType);
-        // Subscribe to BOTH audio and video — some Agora server-side QoS
-        // refuses to keep delivering video bytes to a viewer that hasn't
-        // acknowledged the audio track. Robot publishes both, so we ack both.
         await rtcClient.subscribe(user, mediaType);
-        log('subscribed to uid=' + user.uid + ' kind=' + mediaType);
+        log('subscribed uid=' + user.uid + ' ' + mediaType);
         if (mediaType === 'audio') {
           if (user.audioTrack) {
             try { user.audioTrack.setVolume(0); } catch (e) {}
@@ -355,11 +356,9 @@
           if (v && v.videoWidth > 0 && v.videoHeight > 0) { videoEl = v; break; }
         }
         if (videoEl) {
-          log('[video] <video> ready: ' + videoEl.videoWidth + 'x' + videoEl.videoHeight);
+          log('[video] ✓ <video> ready: ' + videoEl.videoWidth + 'x' + videoEl.videoHeight);
         } else {
-          log('[video] WARN: no decoded video after 10 s — H.264 not working');
-          log('[video] Firefox+OpenH264: check that media.gmp-gmpopenh264.enabled=true');
-          log('[video] Canvas loop still running — will capture when video appears.');
+          log('[video] ✗ no decoded video after 10 s — H.264/GMP not working');
         }
 
         // ── Periodic stats ────────────────────────────────────────────────────
@@ -384,24 +383,18 @@
             const pc = findPC(rtcClient, 0);
             if (pc) {
               const report = await pc.getStats();
-              let codecs = [];
               report.forEach((r) => {
                 if (r.type === 'inbound-rtp' && r.kind === 'video')
                   raw = {bytes: r.bytesReceived, framesRx: r.framesReceived,
                          framesDec: r.framesDecoded, kf: r.keyFramesDecoded};
-                if (r.type === 'codec' && statsCount === 1)
-                  codecs.push(r.mimeType + '/pt=' + r.payloadType);
               });
-              if (statsCount === 1 && codecs.length)
-                log('[stats] codecs: ' + codecs.join(', '));
             }
           } catch (_) {}
-          log('[video] captured=' + capturedFrames +
-              ' raw.bytes='  + (raw.bytes    || 0) +
-              ' framesRx='   + (raw.framesRx  != null ? raw.framesRx  : '?') +
-              ' framesDec='  + (raw.framesDec != null ? raw.framesDec : '?') +
-              ' kf='         + (raw.kf || 0));
-        }, 5000);
+          log('[stats] cap=' + capturedFrames +
+              ' bytes=' + (raw.bytes || 0) +
+              ' dec='   + (raw.framesDec != null ? raw.framesDec : '?') +
+              ' kf='    + (raw.kf || 0));
+        }, 15000);
 
         // ── Canvas capture loop ───────────────────────────────────────────────
         const tick = () => {
@@ -434,14 +427,12 @@
           setTimeout(tick, minInterval);
         };
         tick();
-        log('[video] canvas capture loop started');
       });
 
       rtcClient.on('user-unpublished', (user, mediaType) => {
-        log('user-unpublished uid=' + user.uid + ' kind=' + mediaType);
+        log('user-unpublished uid=' + user.uid + ' ' + mediaType);
       });
-      rtcClient.on('user-joined',  (user) => log('user-joined  uid=' + user.uid));
-      rtcClient.on('user-left',    (user, reason) => log('user-left    uid=' + user.uid + ' reason=' + reason));
+      rtcClient.on('user-left', (user, reason) => log('user-left uid=' + user.uid + ' ' + reason));
 
       const rtcUid = await rtcClient.join(
         cfg.app_id, cfg.channel, cfg.token,
@@ -461,42 +452,23 @@
         log('[!] RTM credentials missing — robot likely will not publish');
       } else {
         const rtmClient = AgoraRTM.createInstance(cfg.app_id);
-        rtmClient.on('ConnectionStateChanged', (state, reason) =>
-          log('RTM state=' + state + ' reason=' + reason));
+        rtmClient.on('ConnectionStateChanged', (state, reason) => {
+          if (state === 'DISCONNECTED' || state === 'ABORTED')
+            log('RTM ' + state + ' reason=' + reason);
+        });
 
-        // Capture every peer message the robot sends back. Each Loona RTM packet
-        // is the standard binary format [LENGTH:int32 LE][CMD:int32 LE][BODY].
-        const hexdump = (u8) => {
-          let h = '';
-          for (let i = 0; i < u8.length; i++) {
-            h += u8[i].toString(16).padStart(2, '0') + (i < u8.length - 1 ? ' ' : '');
-            if (i > 64) { h += '...'; break; }
-          }
-          return h;
-        };
         rtmClient.on('MessageFromPeer', (msg, peerId) => {
           const raw = msg && msg.rawMessage;
           if (raw) {
-            // Decode header; rawMessage may be Uint8Array or ArrayBuffer.
             const u8 = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
-            let cmd = -1, len = -1;
-            if (u8.length >= 8) {
-              const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-              len = dv.getInt32(0, true);
-              cmd = dv.getInt32(4, true);
-            }
-            log('RTM<-peer ' + peerId.slice(0,12) + '... cmd=' + cmd +
-                ' len=' + len + ' bytes=' + u8.length + ' [' + hexdump(u8) + ']');
-            // Forward to Python as text frame (JSON envelope) so we don't confuse
-            // it with JPEG binary frames.
+            let cmd = -1;
+            if (u8.length >= 8) cmd = new DataView(u8.buffer, u8.byteOffset, u8.byteLength).getInt32(4, true);
+            log('RTM<- cmd=' + cmd + ' bytes=' + u8.length);
             if (ws.readyState === 1) {
               try {
-                const arr = Array.from(u8);
-                ws.send(JSON.stringify({type: 'rtm', peer: peerId, cmd, len, bytes: arr}));
+                ws.send(JSON.stringify({type: 'rtm', peer: peerId, cmd, bytes: Array.from(u8)}));
               } catch (e) {}
             }
-          } else {
-            log('RTM<-peer ' + peerId.slice(0,12) + '... text=' + msg.text);
           }
         });
 
@@ -508,17 +480,15 @@
           throw e;
         }
 
-        // Build the askVersion packet: cmd=100900, body = int32(500).
         const CMD_CONTROL  = 100900;
         const SUBCMD_ASKVER = 500;
         const askVer = makePacket(CMD_CONTROL, int32LE(SUBCMD_ASKVER));
-        log('sending RTM askVersion (' + askVer.length + ' bytes) to ' + cfg.rtm_uid_loona);
         try {
           await rtmClient.sendMessageToPeer(
             { rawMessage: askVer, description: 'askVersion' },
             cfg.rtm_uid_loona
           );
-          log('RTM askVersion sent OK');
+          log('RTM askVersion sent');
         } catch (e) {
           log('[!] RTM sendMessageToPeer failed: ' + (e && (e.message || JSON.stringify(e))));
         }
