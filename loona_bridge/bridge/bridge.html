@@ -90,6 +90,16 @@
       RTCPeerConnection.prototype.createAnswer = async function(...args) {
         const answer = await origCreateAnswer.apply(this, args);
         if (answer && answer.sdp) {
+          // Log full m=video + all fmtp lines BEFORE any patching, every renegotiation.
+          // Helps diagnose: missing packetization-mode=1, wrong profile, etc.
+          const mvLine = answer.sdp.match(/m=video[^\r\n]+/);
+          const fmtpLines = answer.sdp.match(/a=fmtp:\d+[^\r\n]+/g) || [];
+          if (mvLine) console.log('[sdp-ca-raw] ' + mvLine[0]);
+          fmtpLines.forEach(l => console.log('[sdp-ca-raw] ' + l));
+
+          // Reset per-PT log guard so every renegotiation logs fmtp details.
+          Object.keys(_fmtpLogged).forEach(k => delete _fmtpLogged[k]);
+
           const patched = injectSpsParam(answer.sdp, 'answer');
           if (patched !== answer.sdp) {
             console.log('[sdp-patch] createAnswer: patched H.264 fmtp in answer SDP');

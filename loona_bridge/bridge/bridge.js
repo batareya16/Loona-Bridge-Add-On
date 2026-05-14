@@ -339,6 +339,41 @@ function findSdkFile(pkgName, candidates) {
         if (window.webkitAudioContext) window.webkitAudioContext = PatchedAC;
       }
     } catch (e) {}
+    // ── Intercept RTCPeerConnection constructor ──────────────────────────────
+    // Log config (especially encodedInsertableStreams:true which means Agora
+    // will call createEncodedStreams() and bypass Firefox's native H.264 decode).
+    try {
+      const _OrigPC = window.RTCPeerConnection;
+      window.RTCPeerConnection = function(config, constraints) {
+        if (config) {
+          const {iceServers: _ign, ...rest} = config;
+          if (Object.keys(rest).length)
+            console.log('[pc-new] ' + JSON.stringify(rest));
+        }
+        return new _OrigPC(config, constraints);
+      };
+      window.RTCPeerConnection.prototype = _OrigPC.prototype;
+      Object.setPrototypeOf(window.RTCPeerConnection, _OrigPC);
+    } catch(e) {}
+
+    // ── Intercept createEncodedStreams ───────────────────────────────────────
+    // If Agora calls this, it owns the encoded bitstream — Firefox's native
+    // decoder never sees frames → framesReceived=0, framesDecoded=0, pliCount=0.
+    // Log it so we can confirm the hypothesis; passthrough for now.
+    try {
+      if (RTCRtpReceiver.prototype.createEncodedStreams) {
+        const _origCES = RTCRtpReceiver.prototype.createEncodedStreams;
+        RTCRtpReceiver.prototype.createEncodedStreams = function() {
+          console.log('[enc-streams] createEncodedStreams called kind=' +
+            (this.track && this.track.kind || '?'));
+          return _origCES.apply(this, arguments);
+        };
+        console.log('[bridge-init] createEncodedStreams intercepted (diagnostic)');
+      } else {
+        console.log('[bridge-init] createEncodedStreams not present in this Firefox');
+      }
+    } catch(e) {}
+
     console.log('[bridge-init] visibility override + AudioContext patch applied');
   });
 
