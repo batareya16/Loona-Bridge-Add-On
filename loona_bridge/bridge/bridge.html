@@ -152,7 +152,17 @@
       const wsFirstOpen = new Promise((res) => { _wsResolve = res; });
       let wsEverOpened        = false;
       let wsConsecutiveFails  = 0;
-      const WS_MAX_FAILS      = 20;  // 20 × 3 s = 60 s of solid failure → exit + restart
+      const WS_MAX_FAILS      = 20;   // 20 × 3 s = 60 s after first open → exit + restart
+      const WS_FIRST_TIMEOUT  = 150;  // 150 s without ever opening → stale port → exit + restart
+                                      // (Python wake_robot takes ≤90 s, so 150 s is enough
+                                      //  for a healthy start; gives up on a dead port after that)
+      let wsNeverOpenedTimer  = setTimeout(() => {
+        if (!wsEverOpened) {
+          log('[FATAL] ws never connected in ' + WS_FIRST_TIMEOUT + ' s — ' +
+              'bridge-config.json likely has a stale port (Python restarted). ' +
+              'Requesting bridge restart to re-read config.');
+        }
+      }, WS_FIRST_TIMEOUT * 1000);
 
       function openWs() {
         ws = new WebSocket(wsUrl);
@@ -160,6 +170,7 @@
         ws.onopen = () => {
           wsEverOpened       = true;
           wsConsecutiveFails = 0;
+          clearTimeout(wsNeverOpenedTimer);
           log('ws open');
           if (_wsResolve) { _wsResolve(); _wsResolve = null; }
         };
