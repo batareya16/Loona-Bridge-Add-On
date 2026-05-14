@@ -155,6 +155,7 @@ function findSdkFile(pkgName, candidates) {
       'media.navigator.streams.fake':        false,
       // OpenH264 GMP — required for WebRTC H.264 encode AND decode in Firefox.
       // Firefox downloads ~1 MB from Mozilla CDN on first run; cached in profile.
+      'media.gmp-manager.updateEnabled':     true,  // Playwright may set this false — override
       'media.gmp-gmpopenh264.enabled':       true,
       'media.gmp-gmpopenh264.autoupdate':    true,
       // Disable background services that slow startup.
