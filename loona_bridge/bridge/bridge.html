@@ -427,6 +427,21 @@
           log('[video] remoteTrack.play() error: ' + e.message);
         }
 
+        // ── PC finder (used by frame-counter transform AND periodic stats) ─────
+        const isPC = (o) => o && typeof o === 'object' &&
+          typeof o.getStats === 'function' && typeof o.getReceivers === 'function';
+        const findPC = (obj, d) => {
+          if (d > 7 || !obj || typeof obj !== 'object') return null;
+          if (isPC(obj)) return obj;
+          try { for (const k of Object.keys(obj)) {
+            try { const v = obj[k];
+              if (v && typeof v === 'object' && !Array.isArray(v)) {
+                const r = findPC(v, d + 1); if (r) return r; }
+            } catch (_) {}
+          }} catch (_) {}
+          return null;
+        };
+
         // Frame-counter RTCRtpScriptTransform:
         // If [xform] frame#N logs appear → jitter buffer IS assembling H264 frames
         //   from RTP (depacketizer works) but GMP decoder fails → different issue.
@@ -495,19 +510,6 @@
         }
 
         // ── Periodic stats ────────────────────────────────────────────────────
-        const isPC = (o) => o && typeof o === 'object' &&
-          typeof o.getStats === 'function' && typeof o.getReceivers === 'function';
-        const findPC = (obj, d) => {
-          if (d > 7 || !obj || typeof obj !== 'object') return null;
-          if (isPC(obj)) return obj;
-          try { for (const k of Object.keys(obj)) {
-            try { const v = obj[k];
-              if (v && typeof v === 'object' && !Array.isArray(v)) {
-                const r = findPC(v, d + 1); if (r) return r; }
-            } catch (_) {}
-          }} catch (_) {}
-          return null;
-        };
         let statsCount = 0;
         setInterval(async () => {
           statsCount++;
