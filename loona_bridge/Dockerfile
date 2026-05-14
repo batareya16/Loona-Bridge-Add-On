@@ -34,52 +34,12 @@ RUN npm install --omit=dev \
     && npm cache clean --force
 
 # 3) Pre-warm Firefox profile: trigger OpenH264 GMP download from Mozilla CDN.
-#    Firefox downloads ~1 MB and saves it to /opt/ff-profile/gmp-gmpopenh264/.
-#    This bakes the GMP into the image so H.264 works immediately at runtime
-#    without an internet request. Falls back gracefully if CDN unreachable.
-RUN node - <<'EOF'
-const { firefox } = require('playwright');
-const fs = require('fs');
-const PROFILE = '/opt/ff-profile';
-fs.mkdirSync(PROFILE, { recursive: true });
-(async () => {
-  console.log('[prewarm] launching Firefox to download OpenH264 GMP...');
-  const ctx = await firefox.launchPersistentContext(PROFILE, {
-    headless: true,
-    firefoxUserPrefs: {
-      'media.gmp-gmpopenh264.enabled':    true,
-      'media.gmp-gmpopenh264.autoupdate': true,
-      'app.update.enabled':               false,
-      'toolkit.telemetry.enabled':        false,
-      'datareporting.healthreport.service.enabled': false,
-    },
-  });
-  const page = await ctx.newPage();
-  await page.goto('about:blank');
-  // Wait up to 30 s for GMP download (it is async in Firefox's background).
-  for (let i = 0; i < 30; i++) {
-    await new Promise(r => setTimeout(r, 1000));
-    const gmpDir = PROFILE + '/gmp-gmpopenh264';
-    if (fs.existsSync(gmpDir)) {
-      const vers = fs.readdirSync(gmpDir);
-      if (vers.length > 0) {
-        console.log('[prewarm] OpenH264 GMP downloaded: ' + gmpDir + '/' + vers[0]);
-        break;
-      }
-    }
-    if (i % 5 === 4) console.log('[prewarm] waiting for GMP... (' + (i+1) + 's)');
-  }
-  await ctx.close();
-  const gmpDir = PROFILE + '/gmp-gmpopenh264';
-  if (fs.existsSync(gmpDir)) {
-    console.log('[prewarm] SUCCESS — OpenH264 baked into image');
-  } else {
-    console.log('[prewarm] GMP not found — will download at first runtime (H.264 may fail until then)');
-  }
-})().catch(e => {
-  console.error('[prewarm] error: ' + e.message + ' — continuing without pre-warm');
-});
-EOF
+#    Uses RTCPeerConnection.createOffer() to trigger GMP download (more reliable
+#    than about:blank which doesn't request codec support).
+#    Falls back gracefully if CDN unreachable — bridge.html waitForH264Codec()
+#    handles the runtime fallback.
+COPY prewarm.js /tmp/prewarm.js
+RUN node /tmp/prewarm.js && rm /tmp/prewarm.js
 
 COPY bridge/ ./
 
