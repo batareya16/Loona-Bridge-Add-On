@@ -146,21 +146,41 @@ function findSdkFile(pkgName, candidates) {
   const hasGmpDir  = fs.existsSync(gmpProfileDir);
   const GMP_INFO_PATH = path.join(__dirname, 'gmp-version.json');  // /opt/loona-bridge/gmp-version.json
   let gmpVersionPrefs = {};
+
+  // Try Phase 2 first (gmp-version.json written by prewarm manual install).
   try {
     const info = JSON.parse(fs.readFileSync(GMP_INFO_PATH, 'utf8'));
     if (info.version && info.abi) {
       gmpVersionPrefs = {
-        // Declare the installed version so Firefox loads the manually placed .so.
-        // These override prefs.js entries — safe because prefs.js may not have them
-        // when Phase 2 (manual install) was used instead of Firefox auto-download.
         'media.gmp-gmpopenh264.version':    info.version,
         'media.gmp-gmpopenh264.abi':        info.abi,
+        // Keep lastUpdate fresh — stale timestamp (image built weeks ago) causes
+        // Firefox to mark the GMP as needing re-download and silently stop decoding.
         'media.gmp-gmpopenh264.lastUpdate': Math.floor(Date.now() / 1000) - 86400,
       };
-      console.error('[bridge] GMP manual install: v' + info.version + ' (' + info.abi + ')');
+      console.error('[bridge] GMP Phase 2 (manual install): v' + info.version + ' (' + info.abi + ')');
     }
   } catch (_) {
-    // No gmp-version.json — Phase 1 was used, prefs.js has the registration already.
+    // No gmp-version.json — Phase 1 was used; read version+abi from prefs.js so
+    // we can inject a fresh lastUpdate.  Without this, an image built weeks ago
+    // has a stale lastUpdate in prefs.js and Firefox silently refuses to decode.
+    try {
+      const prefsJs = fs.readFileSync(path.join(PROFILE_DIR, 'prefs.js'), 'utf8');
+      const vM = prefsJs.match(/"media\.gmp-gmpopenh264\.version",\s*"([^"]+)"/);
+      const aM = prefsJs.match(/"media\.gmp-gmpopenh264\.abi",\s*"([^"]+)"/);
+      if (vM && aM) {
+        gmpVersionPrefs = {
+          'media.gmp-gmpopenh264.version':    vM[1],
+          'media.gmp-gmpopenh264.abi':        aM[1],
+          'media.gmp-gmpopenh264.lastUpdate': Math.floor(Date.now() / 1000) - 86400,
+        };
+        console.error('[bridge] GMP Phase 1 (auto-download, refreshed lastUpdate): v' + vM[1] + ' (' + aM[1] + ')');
+      } else {
+        console.error('[bridge] GMP Phase 1 (auto-download): prefs.js has no version/abi — using as-is');
+      }
+    } catch (e2) {
+      console.error('[bridge] GMP: could not read prefs.js: ' + e2.message);
+    }
   }
 
   const hasGmp = hasGmpDir || Object.keys(gmpVersionPrefs).length > 0;
@@ -184,8 +204,18 @@ function findSdkFile(pkgName, candidates) {
       'media.gmp-manager.updateEnabled':     true,   // keep manager on for initial install
       'media.gmp-gmpopenh264.enabled':       true,
       'media.gmp-gmpopenh264.autoupdate':    false,  // OFF — don't evict pre-warmed GMP
-      // Inject version prefs when Phase 2 (manual install) was used.
+      // Inject fresh version/abi/lastUpdate prefs (read from prefs.js or gmp-version.json
+      // above).  Required because:
+      //  a) Playwright rewrites user.js on every launch, erasing prefs.js GMP entries.
+      //  b) lastUpdate from image-build-time becomes stale → Firefox marks GMP as
+      //     needing update → silently skips decode even though .so is physically present.
       ...gmpVersionPrefs,
+      // Disable content-process sandbox.
+      // In Docker (seccomp restricted) the GMP content process (runs libgmpopenh264.so)
+      // may fail to spawn if Firefox's own seccomp layer is active at the same time as
+      // Docker's policy.  Level 0 = no Firefox seccomp — GMP process starts cleanly.
+      // The GMP still runs in a separate OS process; only Firefox's extra seccomp is off.
+      'security.sandbox.content.level':     0,
       // Disable background services that slow startup.
       'app.update.enabled':                  false,
       'toolkit.telemetry.enabled':           false,

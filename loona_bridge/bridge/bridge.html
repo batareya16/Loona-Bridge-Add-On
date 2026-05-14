@@ -27,19 +27,27 @@
     // the robot to include SPS/PPS in every keyframe, fixing decode failures
     // after PLI/NACK-triggered keyframe re-requests.
     (function patchRtcSdpForH264() {
-      // The robot's SDP has PT 100 defined in two m-sections within the same
-      // BUNDLE group — one with sps-pps-idr-in-keyframe:1 and one without.
-      // Chromium validates that the same PT must have IDENTICAL parameters
-      // across all BUNDLE m-sections and throws INVALID_PARAMETER, which
-      // kills DTLS → no SRTP → raw.bytes=0.
+      // WHY THIS PATCH EXISTS
+      // ─────────────────────
+      // The Loona robot's H.264 encoder will only embed SPS+PPS NAL units inside
+      // every IDR frame (required by OpenH264 GMP decoder to initialise) if the
+      // remote peer (us) includes sps-pps-idr-in-keyframe=1 in the answer fmtp.
+      // Without this, the decoder receives IDR frames without SPS/PPS → cannot
+      // parse the bitstream → framesDecoded stays 0 forever even though
+      // bytesReceived grows (RTP arrives but codec pipeline is broken).
       //
-      // Fix: normalise ALL H.264 fmtp lines in BOTH local and remote descriptions
-      // so every occurrence of PT 100 gets sps-pps-idr-in-keyframe=1. Consistent
-      // params across the whole BUNDLE → no collision → DTLS/SRTP/RTP work.
+      // HOW WE INJECT THE PARAM
+      // ───────────────────────
+      // setLocalDescription patch: handles the traditional form
+      //   setLocalDescription({ type, sdp })
+      // createAnswer patch: handles the modern implicit form used by Agora v4+
+      //   answer = await createAnswer()   →   setLocalDescription(answer)
+      //   or even:  setLocalDescription()   (no-arg, browser auto-creates answer)
+      // By patching createAnswer() we catch the SDP before Agora/browser applies it.
+
       function injectSpsParam(sdpStr) {
-        // Match any fmtp line that contains profile-level-id (identifies H.264).
-        // profile-level-id can be anywhere in the param string, e.g.:
-        //   a=fmtp:100 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f
+        // Match any H.264 fmtp line (identified by profile-level-id).
+        // Works for any PT number and any param order.
         return sdpStr.replace(
           /^(a=fmtp:(\d+) [^\r\n]*profile-level-id=[0-9a-fA-F]+[^\r\n]*)$/mg,
           (line, _, pt) => {
@@ -51,21 +59,48 @@
           }
         );
       }
-      function wrap(proto, method) {
+
+      // Patch createAnswer() — ensures SDP is modified BEFORE setLocalDescription
+      // sees it, regardless of whether setLocalDescription is called with or without args.
+      const origCreateAnswer = RTCPeerConnection.prototype.createAnswer;
+      RTCPeerConnection.prototype.createAnswer = async function(...args) {
+        const answer = await origCreateAnswer.apply(this, args);
+        if (answer && answer.sdp) {
+          const patched = injectSpsParam(answer.sdp);
+          if (patched !== answer.sdp) {
+            console.log('[sdp-patch] createAnswer: patched H.264 fmtp in answer SDP');
+            return new RTCSessionDescription({ type: answer.type, sdp: patched });
+          } else {
+            const hasH264 = /H264|h264/i.test(answer.sdp);
+            console.log('[sdp-patch] createAnswer: H264=' + hasH264 +
+              (hasH264 ? ' sps-pps-idr-in-keyframe already present ✓' : ' (no H264 in answer)'));
+          }
+        }
+        return answer;
+      };
+
+      // Patch setLocalDescription as belt-and-suspenders for explicit-arg call paths.
+      function wrapSetDesc(proto, method) {
         const orig = proto[method];
         proto[method] = function(init) {
           if (init && init.sdp) {
+            const hasH264 = /H264|h264/i.test(init.sdp);
             const patched = injectSpsParam(init.sdp);
+            console.log('[sdp-patch] ' + method + ': H264=' + hasH264 +
+              (patched !== init.sdp ? ' → PATCHED sps-pps-idr-in-keyframe=1' :
+               hasH264 ? ' sps-pps-idr-in-keyframe already ✓' : ''));
             if (patched !== init.sdp) {
               return orig.call(this, { type: init.type, sdp: patched });
             }
+          } else {
+            console.log('[sdp-patch] ' + method + ': called without sdp arg (implicit form — relying on createAnswer patch)');
           }
           return orig.apply(this, arguments);
         };
       }
-      wrap(RTCPeerConnection.prototype, 'setLocalDescription');
-      wrap(RTCPeerConnection.prototype, 'setRemoteDescription');
-      console.log('[sdp-patch] setLocal+setRemoteDescription patched for H.264 BUNDLE consistency');
+      wrapSetDesc(RTCPeerConnection.prototype, 'setLocalDescription');
+      wrapSetDesc(RTCPeerConnection.prototype, 'setRemoteDescription');
+      console.log('[sdp-patch] createAnswer + setLocal + setRemoteDescription patched for H.264 sps-pps-idr-in-keyframe');
     })();
   </script>
   <style>
