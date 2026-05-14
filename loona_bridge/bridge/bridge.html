@@ -64,12 +64,11 @@
             // Downgrade High Profile → Constrained Baseline in answer SDP only.
             if (isAnswer && profileIdc >= 0x64) {
               result = result.replace(plid, '42e01f');
-              console.log('[sdp-patch] PT=' + pt + ' ' + pname + '(' + plid + ') → CBP(42e01f) for OpenH264');
-            } else {
-              console.log('[sdp-patch] PT=' + pt + ' ' + pname + '(' + plid + ')');
+              console.log('[sdp-patch] PT=' + pt + ' ' + pname + '(' + plid + ') → CBP(42e01f)');
             }
             if (!result.includes('sps-pps-idr-in-keyframe')) {
               result += ';sps-pps-idr-in-keyframe=1';
+              console.log('[sdp-patch] PT=' + pt + ' added sps-pps-idr-in-keyframe=1');
             }
             return result;
           }
