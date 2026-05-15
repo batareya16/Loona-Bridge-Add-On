@@ -117,9 +117,32 @@ function findSdkFile(pkgName, candidates) {
     process.exit(2);
   }
   const htmlContent = fs.readFileSync(htmlPath, 'utf8');
+  // Serve bridge.html + static assets (broadway.js, avc.wasm) from __dirname.
+  // avc.wasm is loaded by broadway.js via fetch('avc.wasm', ...) relative to the
+  // page origin, so it must be served from the same HTTP server.
   const httpServer = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(htmlContent);
+    const url = (req.url || '/').split('?')[0];
+    if (url === '/' || url === '/index.html') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(htmlContent);
+      return;
+    }
+    // Serve static files from bridge dir — prevent path traversal
+    const fname = url.replace(/^\/+/, '').replace(/\.\./g, '');
+    if (fname && !fname.includes('/')) {
+      const fpath = path.join(__dirname, fname);
+      try {
+        if (fs.existsSync(fpath) && fs.statSync(fpath).isFile()) {
+          const ext = path.extname(fpath).toLowerCase();
+          const ct = { '.js': 'application/javascript', '.wasm': 'application/wasm',
+                       '.html': 'text/html' }[ext] || 'application/octet-stream';
+          res.writeHead(200, { 'Content-Type': ct });
+          fs.createReadStream(fpath).pipe(res);
+          return;
+        }
+      } catch (_) {}
+    }
+    res.writeHead(404); res.end('Not found');
   });
   const httpPort = await new Promise((resolve, reject) => {
     httpServer.listen(0, '127.0.0.1', () => resolve(httpServer.address().port));
