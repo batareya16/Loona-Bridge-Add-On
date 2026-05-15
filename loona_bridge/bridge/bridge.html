@@ -357,8 +357,12 @@
       // mode, so we go live+host too.
       const rtcMode  = cfg.rtc_mode || 'live';
       const rtcRole  = cfg.role     || 'host';
-      const rtcCodec = cfg.codec    || 'h264';
+      // TEST: try 'vp8' — if Agora transcodes H264→VP8 on the edge and VP8
+      // framesReceived > 0, the issue is H264-specific in Firefox 128 WebRTC.
+      // If VP8 also framesReceived=0 → broader Agora/Firefox pipeline issue.
+      const rtcCodec = cfg.codec    || 'vp8';
       const rtcClient = AgoraRTC.createClient({mode: rtcMode, codec: rtcCodec, role: rtcRole});
+      log('[rtc-codec] using codec=' + rtcCodec + ' mode=' + rtcMode + ' role=' + rtcRole);
 
       // ── Agora connection diagnostics ─────────────────────────────────────────
       rtcClient.on('connection-state-change', (curState, prevState, reason) => {
@@ -454,13 +458,20 @@
               _pc.getReceivers().find(r => r.track && r.track.kind === 'video');
             if (_vrecv) {
               const _wSrc = `
+                self.postMessage('worker-started');
+                let xformFired = false;
+                setTimeout(() => {
+                  if (!xformFired) self.postMessage('xform-event NEVER FIRED after 15s');
+                }, 15000);
                 let n = 0;
                 onrtctransform = ({transformer}) => {
+                  xformFired = true;
+                  self.postMessage('xform-event fired');
                   const rd = transformer.readable.getReader();
                   const wr = transformer.writable.getWriter();
                   (function pump() {
                     rd.read().then(({done, value}) => {
-                      if (done) return;
+                      if (done) { self.postMessage('readable done'); return; }
                       n++;
                       if (n <= 5 || n % 60 === 0)
                         self.postMessage('frame#' + n + ' type=' + value.type +
