@@ -701,7 +701,8 @@
             // Fix: single running buffer — no timestamp needed for in-order delivery
             // (Agora SDK jitter buffer guarantees ordered delivery to the transform).
             let fuBuf = null;  // current FU-A running buffer (Uint8Array | null)
-            const _seenNalTypes = {};
+            let _seenNalTypes = {};
+            const MAX_IDR_RETRIES = 4;
 
             function feedNAL(nal) {
               const ab = new Uint8Array(4 + nal.length);
@@ -758,6 +759,11 @@
                   buf[4] = nalHdr;
                   buf.set(payload.subarray(2), 5);
                   fuBuf = buf;
+                  // FU-A IDR detection: fragNalType=5/7/8 inside FU-A
+                  if ((fragNalType === 5 || fragNalType === 7 || fragNalType === 8) && !bwHasIDR) {
+                    bwHasIDR = true;
+                    log('[broadway] ✓ IDR/SPS/PPS in FU-A: fragNalType=' + fragNalType + ' at pkt#' + bwPacketCount);
+                  }
                 } else if (fuBuf) {
                   // Continue — append data (skip 2-byte FU indicator+header)
                   const prev = fuBuf;
@@ -849,6 +855,10 @@
                 idrRetries++;
                 log('[broadway] IDR recovery #' + idrRetries +
                   ': pkts=' + bwPacketCount + ' hasIDR=' + bwHasIDR);
+                if (idrRetries > MAX_IDR_RETRIES) {
+                  log('[broadway] IDR recovery: gave up after ' + MAX_IDR_RETRIES + ' retries — check robot stream');
+                  return;
+                }
                 // Attempt 1: RTCP PLI via requestKeyFrame() (Firefox WebRTC-extensions)
                 if (_audRecv && typeof _audRecv.requestKeyFrame === 'function') {
                   try {
@@ -862,6 +872,7 @@
                 if (idrRetries >= 2) {
                   log('[broadway] IDR recovery: forcing resubscription for new SPS+PPS+IDR burst...');
                   fuBuf = null; bwHasIDR = false; bwPacketCount = 0;
+                  _seenNalTypes = {};  // reset so we get fresh NAL type logs after resubscribe
                   (async () => {
                     try {
                       await rtcClient.unsubscribe(user);
@@ -874,9 +885,10 @@
                   })();
                 }
               }
-              // Schedule IDR check: 2s after transform install, retry every 8s
+              // Schedule IDR check: 2s after transform install, retry every 8s (max MAX_IDR_RETRIES times)
               setTimeout(function checkIDR() {
                 if (bwFirstFrame) return;
+                if (idrRetries >= MAX_IDR_RETRIES) return;  // stop after max retries
                 if (bwPacketCount > 30) requestIDR();
                 else log('[broadway] IDR check: no packets yet (' + bwPacketCount + ')');
                 setTimeout(checkIDR, 8000);
