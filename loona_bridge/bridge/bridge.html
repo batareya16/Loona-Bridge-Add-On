@@ -551,20 +551,16 @@
 
       rtcClient.on('user-published', async (user, mediaType) => {
         if (mediaType === 'audio') {
-          // v0.1.66: Subscribe to audio WITHOUT playing it.
-          // Critical for Broadway approach: robot sends H264 video on PT=0 (PCMU).
-          // Firefox routes PT=0 packets to the AUDIO m-section receiver.
-          // If Agora omits audio from SDP (because we skipped subscribe), the robot's
-          // H264/PT=0 packets have no receiver → Broadway gets nothing.
-          // Subscribing ensures Agora negotiates audio m-section (recvonly) in SDP.
-          // NOT calling .play() avoids AudioContext creation in headless Docker.
-          try {
-            await rtcClient.subscribe(user, 'audio');
-            log('[audio] subscribed (no play) — ensures audio m-section in SDP for H264/PT=0');
-            // Do NOT call user.audioTrack.play() — AudioContext.currentTime freeze avoided
-          } catch(e) {
-            log('[audio] subscribe error: ' + e.message);
-          }
+          // v0.1.67: Do NOT subscribe to audio.
+          // Key insight from v0.1.66 test: when audio IS subscribed, Agora negotiates
+          // OPUS (pt=109) for audio, and the robot sends proper OPUS on SSRC=20000.
+          // BUT the H264 video (SSRC=40000 PT=0) completely disappears — robot/edge stops
+          // sending it when a proper audio codec is negotiated.
+          // When audio is NOT subscribed, Agora leaves audio unconfirmed and the robot
+          // sends H264 video on PT=0 (PCMU static slot) SSRC=40000 via the audio receiver.
+          // That H264/PT=0 stream is what Broadway intercepts.
+          // Conclusion: skip audio subscription to keep H264/PT=0 routing working.
+          log('[audio] skip subscription — needed to preserve H264/PT=0 routing to audio receiver');
           return;
         }
         if (mediaType !== 'video') return;
@@ -693,8 +689,16 @@
             // RFC 6184: H264 RTP payloads may be single NAL (type 1-23),
             // STAP-A (type 24, multiple NALs in one packet), or
             // FU-A (type 28, one NAL fragmented across multiple packets).
-            const fuBufs = {};  // timestamp → Uint8Array (growing Annex B buffer)
-            let _seenNalTypes = {};
+            //
+            // v0.1.67 FU-A fix: Firefox RTCRtpScriptTransform metadata does NOT
+            // expose rtpTimestamp (fields: contributingSources, payloadType,
+            // sequenceNumber, synchronizationSource only).
+            // Previous code used timestamp-keyed map → all keys = "0" or seq counter
+            // → fragments never matched → FU-A never decoded.
+            // Fix: single running buffer — no timestamp needed for in-order delivery
+            // (Agora SDK jitter buffer guarantees ordered delivery to the transform).
+            let fuBuf = null;  // current FU-A running buffer (Uint8Array | null)
+            const _seenNalTypes = {};
 
             function feedNAL(nal) {
               const ab = new Uint8Array(4 + nal.length);
@@ -715,9 +719,12 @@
               }
 
               if (nalType >= 1 && nalType <= 23) {
+                // Single NAL — any non-IDR fragment resets pending FU-A
+                fuBuf = null;
                 feedNAL(payload);
               } else if (nalType === 24) {
-                // STAP-A
+                // STAP-A: multiple NALs concatenated
+                fuBuf = null;
                 let off = 1;
                 while (off + 2 <= payload.length) {
                   const sz = (payload[off] << 8) | payload[off + 1]; off += 2;
@@ -725,36 +732,35 @@
                   off += sz;
                 }
               } else if (nalType === 28) {
-                // FU-A
+                // FU-A fragmented NAL
                 if (payload.length < 2) return;
                 const fuH = payload[1];
                 const S = (fuH >> 7) & 1, E = (fuH >> 6) & 1;
                 const fragNalType = fuH & 0x1F;
                 const nalHdr = (payload[0] & 0xE0) | fragNalType;
-                const key = (ts >>> 0).toString();
+
                 if (S) {
+                  // Start of new fragmented NAL — allocate with Annex-B header + nalHdr + first data
                   const buf = new Uint8Array(4 + 1 + payload.length - 2);
                   buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 1;
                   buf[4] = nalHdr;
                   buf.set(payload.subarray(2), 5);
-                  fuBufs[key] = buf;
-                } else if (fuBufs[key]) {
-                  const prev = fuBufs[key];
+                  fuBuf = buf;
+                } else if (fuBuf) {
+                  // Continue — append data (skip 2-byte FU indicator+header)
+                  const prev = fuBuf;
                   const next = new Uint8Array(prev.length + payload.length - 2);
                   next.set(prev);
                   next.set(payload.subarray(2), prev.length);
-                  fuBufs[key] = next;
+                  fuBuf = next;
                 }
-                if (E && fuBufs[key]) {
-                  try { bwDecoder.decode(fuBufs[key]); } catch(_) {}
-                  delete fuBufs[key];
-                  // Clean up stale buffers (> 5 s old by RTP clock @90kHz)
-                  const now32 = ts >>> 0;
-                  for (const k of Object.keys(fuBufs)) {
-                    if (Math.abs(parseInt(k) - now32) > 450000) delete fuBufs[k];
-                  }
+                // End bit — decode the assembled NAL
+                if (E && fuBuf) {
+                  try { bwDecoder.decode(fuBuf); } catch(_) {}
+                  fuBuf = null;
                 }
               }
+              // nalType 0, 25-27, 29-31 → unsupported/reserved, ignore
             }
 
             // Install RTCRtpScriptTransform on the audio receiver.
@@ -790,6 +796,15 @@
                                : (meta.timestamp     !== undefined) ? meta.timestamp
                                : n; // fallback: use sequence number as unique key
                       const seq = meta.sequenceNumber !== undefined ? meta.sequenceNumber : n;
+                      // Filter: only forward PT=0 (H264 misidentified as PCMU).
+                      // PT=109 = Opus audio (real audio subscription artifact — should not arrive
+                      // here if audio is not subscribed, but guard just in case).
+                      const pt = meta.payloadType;
+                      if (pt !== undefined && pt !== 0) {
+                        // Not PT=0 — real audio codec, not H264 — skip
+                        wr.write(value).then(pump).catch(() => pump());
+                        return;
+                      }
                       // Log first few payload bytes for format diagnosis
                       if (n <= 2 && value.data && value.data.byteLength >= 4) {
                         const b = new Uint8Array(value.data);
