@@ -551,21 +551,32 @@
 
       rtcClient.on('user-published', async (user, mediaType) => {
         if (mediaType === 'audio') {
-          // Skip audio subscription intentionally.
-          // Subscribing to audio causes Agora to call `new AudioContext()`.
-          // In headless Firefox inside Docker (no audio device), the context
-          // stays suspended → currentTime=0 → Agora warns "stuck at 0" and
-          // freezes its video jitter-buffer scheduler → framesDecoded stays 0.
-          // We only need video frames; audio is unused.
-          // The AudioContext.prototype.currentTime synthetic-time patch in
-          // bridge.js is a belt-and-suspenders fix if Agora creates a context
-          // for any other reason.
-          log('[audio] skip subscription (headless Docker — no audio device)');
+          // v0.1.66: Subscribe to audio WITHOUT playing it.
+          // Critical for Broadway approach: robot sends H264 video on PT=0 (PCMU).
+          // Firefox routes PT=0 packets to the AUDIO m-section receiver.
+          // If Agora omits audio from SDP (because we skipped subscribe), the robot's
+          // H264/PT=0 packets have no receiver → Broadway gets nothing.
+          // Subscribing ensures Agora negotiates audio m-section (recvonly) in SDP.
+          // NOT calling .play() avoids AudioContext creation in headless Docker.
+          try {
+            await rtcClient.subscribe(user, 'audio');
+            log('[audio] subscribed (no play) — ensures audio m-section in SDP for H264/PT=0');
+            // Do NOT call user.audioTrack.play() — AudioContext.currentTime freeze avoided
+          } catch(e) {
+            log('[audio] subscribe error: ' + e.message);
+          }
           return;
         }
         if (mediaType !== 'video') return;
         await rtcClient.subscribe(user, mediaType);
         log('subscribed uid=' + user.uid + ' ' + mediaType);
+        // Re-send askVersion after subscription — robot may need this as a trigger
+        // to continue publishing. First send happens during RTM init (before user-published).
+        // Second send here ensures robot gets it after we've confirmed it's in the channel.
+        if (window._rtmSendAskVer) {
+          try { await window._rtmSendAskVer(); log('RTM askVersion re-sent after subscribe'); }
+          catch(e) { log('[!] RTM askVersion re-send failed: ' + e.message); }
+        }
         if (broadwayActive) {
           log('[video] already running — resubscribe complete, new IDR expected');
           return;
@@ -874,11 +885,30 @@
           if (v) {
             const tracks = v.srcObject ? v.srcObject.getTracks() : [];
             const trk = tracks[0];
+            const muted = trk ? trk.muted : 'n/a';
             log('[video-dbg] readyState=' + v.readyState +
                 ' paused=' + v.paused +
                 ' err=' + (v.error ? v.error.code : 'null') +
                 ' srcObj=tracks=' + tracks.length +
-                (trk ? (' trk.state=' + trk.readyState + ' trk.muted=' + trk.muted) : ''));
+                (trk ? (' trk.state=' + trk.readyState + ' trk.muted=' + muted) : ''));
+            // If track is muted (robot not sending), re-send askVersion and re-subscribe
+            if (muted === true) {
+              log('[video] trk.muted → re-sending askVersion + re-subscribing in 3s');
+              setTimeout(async () => {
+                try {
+                  if (window._rtmSendAskVer) { await window._rtmSendAskVer(); log('RTM askVersion re-sent (muted retry)'); }
+                } catch(e) { log('[!] muted retry askVersion failed: ' + e.message); }
+                try {
+                  await rtcClient.unsubscribe(user);
+                  log('[video] unsubscribed for muted retry');
+                  await new Promise(r => setTimeout(r, 1000));
+                  broadwayActive = false;  // allow re-init
+                  // user-published will fire again after unsubscribe+resubscribe
+                  await rtcClient.subscribe(user, 'video');
+                  log('[video] re-subscribed (muted retry)');
+                } catch(e) { log('[!] muted retry re-subscribe failed: ' + e.message); }
+              }, 3000);
+            }
           } else {
             log('[video-dbg] no <video> in container');
           }
@@ -892,6 +922,15 @@
           try {
             const pc = findBestPC(rtcClient);
             if (pc) {
+              // Log ICE/connection state on first stats interval for diagnosis
+              if (statsCount === 1) {
+                log('[pc-state] iceConnectionState=' + pc.iceConnectionState +
+                    ' connectionState=' + pc.connectionState +
+                    ' signalingState=' + pc.signalingState);
+                const recv = pc.getReceivers();
+                recv.forEach((r, i) => log('[pc-recv#' + i + '] kind=' + r.track.kind +
+                    ' readyState=' + r.track.readyState + ' muted=' + r.track.muted));
+              }
               const report = await pc.getStats();
               // Build codec map (id → {mimeType, payloadType})
               const codecMap = {};
@@ -1090,6 +1129,15 @@
         const CMD_CONTROL  = 100900;
         const SUBCMD_ASKVER = 500;
         const askVer = makePacket(CMD_CONTROL, int32LE(SUBCMD_ASKVER));
+
+        // Expose askVersion sender for re-use after subscription
+        window._rtmSendAskVer = async () => {
+          await rtmClient.sendMessageToPeer(
+            { rawMessage: makePacket(CMD_CONTROL, int32LE(SUBCMD_ASKVER)), description: 'askVersion' },
+            cfg.rtm_uid_loona
+          );
+        };
+
         try {
           await rtmClient.sendMessageToPeer(
             { rawMessage: askVer, description: 'askVersion' },
