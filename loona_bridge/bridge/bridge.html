@@ -53,6 +53,11 @@
       const _fmtpLogged = {};  // log each PT's full fmtp once per session
       function injectSpsParam(sdpStr, role) {
         const isAnswer = (role === 'answer');
+        // 'local' role: profile downgrade only, NO sps-pps-idr-in-keyframe injection.
+        // Used by wrapSetDesc so Firefox's H264 depacketizer works without that
+        // constraint (which causes framesReceived=0 / jitterBufferEmittedCount=0).
+        // Robot still gets sps-pps-idr-in-keyframe via createAnswer signaling.
+        const doProfileDown = (role === 'answer' || role === 'local');
         return sdpStr.replace(
           /^(a=fmtp:(\d+) [^\r\n]*profile-level-id=([0-9a-fA-F]{6})[^\r\n]*)$/mg,
           (line, _, pt, plid) => {
@@ -68,19 +73,18 @@
               const fmtpParams = line.replace(/^a=fmtp:\d+ /, '');
               console.log('[sdp-fmtp] answer PT=' + pt + ' ' + fmtpParams);
             }
-            // Downgrade High Profile → Constrained Baseline in answer SDP only.
-            if (isAnswer && profileIdc >= 0x64) {
+            // Downgrade High Profile → Constrained Baseline for answer and local SDP.
+            if (doProfileDown && profileIdc >= 0x64) {
               result = result.replace(plid, '42e01f');
-              console.log('[sdp-patch] PT=' + pt + ' ' + pname + '(' + plid + ') → CBP(42e01f)');
+              console.log('[sdp-patch] PT=' + pt + ' ' + pname + '(' + plid + ') → CBP(42e01f) [role=' + role + ']');
             }
-            // Inject sps-pps-idr-in-keyframe=1 into H264 answer fmtp.
-            // REQUIRED: without this, Agora edge mutes the video track entirely
-            // (trk.muted=true, no inbound-rtp entry, bytes=0).
-            // The robot adds sps-pps-idr-in-keyframe=1 to its OWN offer when it
-            // starts publishing; echoing it back in our answer unlocks RTP delivery.
+            // Inject sps-pps-idr-in-keyframe=1 into H264 ANSWER fmtp ONLY.
+            // REQUIRED in answer: without this Agora edge mutes video track entirely.
+            // NOT injected for 'local' role: Firefox's H264 depacketizer malfunctions
+            // when this param is present in setLocalDescription SDP → framesReceived=0.
             if (isAnswer && !result.includes('sps-pps-idr-in-keyframe')) {
               result += ';sps-pps-idr-in-keyframe=1';
-              console.log('[sdp-patch] PT=' + pt + ' +sps-pps-idr-in-keyframe');
+              console.log('[sdp-patch] PT=' + pt + ' +sps-pps-idr-in-keyframe (answer only)');
             }
             return result;
           }
@@ -116,16 +120,25 @@
         return answer;
       };
 
-      // Patch setLocalDescription as belt-and-suspenders for explicit-arg call paths.
+      // Patch setLocalDescription: strip sps-pps-idr-in-keyframe BEFORE Firefox sees it.
+      // Firefox 128 H264 depacketizer malfunctions when this param is present in the
+      // local SDP → jitterBufferEmittedCount=0, framesReceived=0 forever.
+      // Robot gets the param via createAnswer signaling (Agora SDP exchange), so RTP
+      // delivery is unaffected. Only Firefox's local decoder config needs it gone.
       function wrapSetDesc(proto, method) {
         const orig = proto[method];
         proto[method] = function(init) {
           if (init && init.sdp) {
             const hasH264 = /H264|h264/i.test(init.sdp);
-            const patched = injectSpsParam(init.sdp, 'answer');
+            // Strip sps-pps-idr-in-keyframe — Firefox must not see this in local SDP.
+            const stripped = init.sdp.replace(/;sps-pps-idr-in-keyframe=\d/g, '');
+            const strippedIt = (stripped !== init.sdp);
+            // Profile downgrade only ('local' role — no sps-pps re-injection).
+            const patched = injectSpsParam(stripped, 'local');
             console.log('[sdp-patch] ' + method + ': H264=' + hasH264 +
-              (patched !== init.sdp ? ' → PATCHED (profile downgrade)' :
-               hasH264 ? ' no patch needed' : ''));
+              (strippedIt ? ' stripped sps-pps-idr-in-keyframe' : '') +
+              (patched !== stripped ? ' → PATCHED (profile downgrade)' :
+               (!strippedIt && hasH264) ? ' no patch needed' : ''));
             if (patched !== init.sdp) {
               return orig.call(this, { type: init.type, sdp: patched });
             }
@@ -357,10 +370,7 @@
       // mode, so we go live+host too.
       const rtcMode  = cfg.rtc_mode || 'live';
       const rtcRole  = cfg.role     || 'host';
-      // TEST: try 'vp8' — if Agora transcodes H264→VP8 on the edge and VP8
-      // framesReceived > 0, the issue is H264-specific in Firefox 128 WebRTC.
-      // If VP8 also framesReceived=0 → broader Agora/Firefox pipeline issue.
-      const rtcCodec = cfg.codec    || 'vp8';
+      const rtcCodec = cfg.codec || 'h264';
       const rtcClient = AgoraRTC.createClient({mode: rtcMode, codec: rtcCodec, role: rtcRole});
       log('[rtc-codec] using codec=' + rtcCodec + ' mode=' + rtcMode + ' role=' + rtcRole);
 
