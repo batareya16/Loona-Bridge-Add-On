@@ -304,10 +304,26 @@ function findSdkFile(pkgName, candidates) {
       shutdown();
     }
   });
-  page.on('pageerror', (err) => console.error('[bridge js ERROR] ' + err.message));
+  page.on('pageerror', (err) => {
+    const msg = err && err.message || String(err);
+    // Broadway.js WASM abort is an expected error during initialization if
+    // avc.wasm fetch races with something — log but don't treat as fatal.
+    if (msg.includes('wasmBinary') || msg.includes('broadwayOnPicture') ||
+        msg.includes('on the web, we need the wasm')) {
+      console.error('[bridge js WASM-ABORT] ' + msg.slice(0, 120));
+      return;
+    }
+    console.error('[bridge js ERROR] ' + msg);
+  });
 
   await page.goto('http://127.0.0.1:' + httpPort + '/', { waitUntil: 'load' });
-  httpServer.close();
+  // NOTE: httpServer is intentionally NOT closed here.
+  // broadway.js (loaded via <script src="/broadway.js"> in bridge.html) starts
+  // WebAssembly.instantiateStreaming(fetch('avc.wasm')) asynchronously — this
+  // fetch fires AFTER the 'load' event and would fail if the server were closed.
+  // The server binds to 127.0.0.1:0 (random port, local-only) and will be
+  // garbage-collected when the Node.js process exits.
+  console.error('[bridge] HTML server kept alive for avc.wasm fetch');
 
   // Override visibility API — headless Firefox reports page as "hidden", which
   // causes <video> elements to immediately suspend (Agora: "waiting => suspend")
@@ -416,29 +432,6 @@ function findSdkFile(pkgName, candidates) {
   });
 
   // Inject the SDK bundles directly.
-  // FIRST: pre-load avc.wasm and inject broadway.js with Module.wasmBinary already set.
-  // broadway.js (Emscripten H264 decoder) does fetch('avc.wasm') asynchronously after
-  // the page load event.  By the time that fetch runs, httpServer is already closed
-  // (we close it right after page.goto waitUntil:load).  To avoid the NetworkError,
-  // we read avc.wasm in Node.js, base64-encode it, and inject it as window.Module.wasmBinary
-  // BEFORE broadway.js runs — Emscripten checks Module.wasmBinary first and skips fetch.
-  const broadwayPath = path.join(__dirname, 'broadway.js');
-  const wasmPath     = path.join(__dirname, 'avc.wasm');
-  if (fs.existsSync(broadwayPath) && fs.existsSync(wasmPath)) {
-    const wasmB64 = fs.readFileSync(wasmPath).toString('base64');
-    await page.addScriptTag({
-      content: `window.Module = window.Module || {};
-window.Module.wasmBinary = Uint8Array.from(atob("${wasmB64}"), function(c){ return c.charCodeAt(0); });
-console.log('[bridge-init] avc.wasm pre-loaded (' + window.Module.wasmBinary.length + ' bytes)');`
-    });
-    await page.addScriptTag({ path: broadwayPath });
-    console.error('[bridge] broadway.js + avc.wasm injected (' + wasmB64.length + ' base64 chars)');
-  } else {
-    console.error('[bridge] WARNING: broadway.js or avc.wasm not found — H264 Broadway decoder disabled');
-    console.error('[bridge]   broadway.js: ' + broadwayPath + ' exists=' + fs.existsSync(broadwayPath));
-    console.error('[bridge]   avc.wasm:    ' + wasmPath + ' exists=' + fs.existsSync(wasmPath));
-  }
-
   await page.addScriptTag({ path: rtcPath });
   await page.addScriptTag({ path: rtmPath });
 

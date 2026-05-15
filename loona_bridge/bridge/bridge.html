@@ -17,19 +17,11 @@
       document.write('<script src="/sdk/rtm.js"><\/script>');
     }
   </script>
-  <!-- broadway.js injected by bridge.js (Playwright addScriptTag) AFTER
-       window.Module.wasmBinary is pre-loaded from Node.js to avoid the async
-       fetch('avc.wasm') race with httpServer.close().
-       When running in manual/browser mode the script is loaded from /broadway.js. -->
-  <script>
-    if (typeof window !== 'undefined' && location.protocol !== 'about:') {
-      // Manual mode only: load broadway.js from HTTP server
-      // In Playwright mode bridge.js injects it after setting Module.wasmBinary
-      if (location.hash && location.hash.startsWith('#cfg=')) {
-        document.write('<script src="/broadway.js"><\/script>');
-      }
-    }
-  </script>
+  <!-- broadway.js: Emscripten H264 decoder (exposes window.Decoder).
+       Fetches avc.wasm asynchronously from the same HTTP origin.
+       bridge.js keeps the HTTP server alive (no httpServer.close()) so this
+       fetch always succeeds regardless of when it fires relative to page load. -->
+  <script src="/broadway.js"></script>
   <script>
     // ── SDP patch: inject sps-pps-idr-in-keyframe ─────────────────────────
     // Loona robot advertises {profile-level-id:42001f; sps-pps-idr-in-keyframe:1}
@@ -1008,6 +1000,12 @@
         log('user-unpublished uid=' + user.uid + ' ' + mediaType);
       });
       rtcClient.on('user-left', (user, reason) => log('user-left uid=' + user.uid + ' ' + reason));
+      // v0.1.64: log track-muted events to diagnose trk.muted=true
+      rtcClient.on('user-info-updated', (uid, msg) => log('[rtc-info] uid=' + uid + ' ' + msg));
+      try {
+        rtcClient.on('media-reconnect-start', (uid) => log('[rtc-reconnect] start uid=' + uid));
+        rtcClient.on('media-reconnect-end',   (uid) => log('[rtc-reconnect] end uid=' + uid));
+      } catch(_) {}
 
       const rtcUid = await rtcClient.join(
         cfg.app_id, cfg.channel, cfg.token,
