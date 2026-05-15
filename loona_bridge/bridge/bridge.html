@@ -589,8 +589,18 @@
                 }
               });
 
-              // First interval: dump all fields + try requestKeyFrame if jitter empty
+              // First interval: full dump + codec map + codecId diagnostic
               if (statsCount === 1) {
+                // Log ALL codec entries so we can see what PT Firefox negotiated
+                const codecEntries = Object.values(codecMap);
+                if (codecEntries.length) {
+                  codecEntries.forEach(c => log('[stats-codec] id=' + c.id +
+                    ' mime=' + c.mimeType + ' pt=' + c.payloadType +
+                    (c.sdpFmtpLine ? ' fmtp=' + c.sdpFmtpLine : '')));
+                } else {
+                  log('[stats-codec] no codec entries in getStats()');
+                }
+
                 videoRx.forEach((r, i) => {
                   const codec = r.codecId && codecMap[r.codecId];
                   const numVals = Object.entries(r)
@@ -600,27 +610,12 @@
                     .filter(([k,v]) => typeof v === 'string' && k !== 'id' && k !== 'type')
                     .map(([k,v]) => k + '=' + v).join(' ');
                   log('[stats-dbg#' + i + '] ssrc=' + r.ssrc +
-                    (codec ? ' codec=' + codec.mimeType + ' pt=' + codec.payloadType : '') +
+                    ' codecId=' + (r.codecId || 'NONE') +
+                    (codec ? ' → ' + codec.mimeType + '/pt=' + codec.payloadType : ' → NO MATCH') +
                     ' | ' + numVals);
                   if (strVals) log('[stats-dbg#' + i + '-str] ' + strVals);
                 });
                 if (videoRx.length === 0) log('[stats-dbg] no inbound-rtp video entries in getStats()');
-                // If jitter buffer still empty, prod it with requestKeyFrame()
-                // (Firefox 128+ RTCRtpReceiver API — forces PLI to robot)
-                if (raw.jbe === 0 && pc) {
-                  try {
-                    pc.getReceivers()
-                      .filter(r => r.track && r.track.kind === 'video')
-                      .forEach(r => {
-                        if (typeof r.requestKeyFrame === 'function') {
-                          r.requestKeyFrame();
-                          log('[rkf] requestKeyFrame() called on video receiver');
-                        } else {
-                          log('[rkf] requestKeyFrame() not available');
-                        }
-                      });
-                  } catch(e) { log('[rkf] error: ' + e.message); }
-                }
               }
 
               // Log all video streams (there may be >1 SSRC)

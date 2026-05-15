@@ -241,6 +241,21 @@ function findSdkFile(pkgName, candidates) {
       // Docker's policy.  Level 0 = no Firefox seccomp — GMP process starts cleanly.
       // The GMP still runs in a separate OS process; only Firefox's extra seccomp is off.
       'security.sandbox.content.level':     0,
+      // ── Force software-only H.264 decode via OpenH264 GMP ───────────────────
+      // On ARM64 (Raspberry Pi 4) Firefox may try VA-API / V4L2 hardware H.264 decode.
+      // Inside Docker the GPU/VPU device nodes (/dev/dri/*, /dev/video*) are typically
+      // not available, so hardware decode init fails silently.
+      // Firefox's WebRTC pipeline initialises the decoder BEFORE starting the jitter
+      // buffer — if decoder init fails, the jitter buffer never starts:
+      //   packetsReceived > 0 (SRTP layer works) but jbe=0, framesReceived=0, pliCount=0.
+      // Disabling hardware decode forces Firefox to use OpenH264 GMP (software) which
+      // is pre-warmed in the persistent profile and works in Docker.
+      'media.hardware-video-decoding.enabled':       false,
+      'media.hardware-video-decoding.force-enabled': false,
+      'media.ffmpeg.vaapi.enabled':                  false,
+      'media.ffmpeg.vaapi-drm-display.enabled':      false,
+      // Ensure GMP decoder is active for WebRTC H.264.
+      'media.gmp.decoder.enabled':                   true,
       // Disable background services that slow startup.
       'app.update.enabled':                  false,
       'toolkit.telemetry.enabled':           false,
