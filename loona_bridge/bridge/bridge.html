@@ -304,6 +304,19 @@
             if (/^m=/.test(l)) inAud0 = /^m=audio/.test(l);
             if (inAud0) console.log('[sdp-offer-aud] ' + l);
           }
+          // Extract sprop-parameter-sets (out-of-band SPS+PPS in SDP)
+          // The robot may deliver SPS/PPS only via sprop-parameter-sets (never in-band)!
+          // Format: a=fmtp:X ...;sprop-parameter-sets=<base64SPS>,<base64PPS>
+          const spropM = init.sdp.match(/sprop-parameter-sets=([A-Za-z0-9+/=]+),?([A-Za-z0-9+/=]*)/);
+          if (spropM) {
+            window._spropSPS = spropM[1] || '';
+            window._spropPPS = spropM[2] || '';
+            console.log('[sdp-sprop] sprop-parameter-sets: SPS=' + window._spropSPS.slice(0,20) +
+              '... PPS=' + window._spropPPS.slice(0,20) + '...');
+          } else {
+            window._spropSPS = null; window._spropPPS = null;
+            console.log('[sdp-sprop] no sprop-parameter-sets in remote SDP');
+          }
           // Strip sps-pps-idr-in-keyframe from robot's offer.
           const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
           if (stripped !== init.sdp)
@@ -711,6 +724,27 @@
               bwDecoder.decode(ab);
             }
 
+            // Pre-feed SPS+PPS from SDP sprop-parameter-sets if present.
+            // The robot may NEVER send SPS/PPS in-band (only via SDP out-of-band delivery).
+            // Without this, Broadway never receives codec params → cannot decode any frame.
+            function prefeedSpropParams() {
+              try {
+                const spsB64 = window._spropSPS, ppsB64 = window._spropPPS;
+                if (spsB64) {
+                  const s = atob(spsB64);
+                  feedNAL(new Uint8Array(s.length).map((_,i) => s.charCodeAt(i)));
+                  log('[broadway] pre-fed SPS from sprop (' + spsB64.length + ' b64 chars)');
+                }
+                if (ppsB64) {
+                  const p = atob(ppsB64);
+                  feedNAL(new Uint8Array(p.length).map((_,i) => p.charCodeAt(i)));
+                  log('[broadway] pre-fed PPS from sprop (' + ppsB64.length + ' b64 chars)');
+                }
+                if (!spsB64 && !ppsB64) log('[broadway] no sprop-parameter-sets in SDP — waiting for in-band SPS/PPS');
+              } catch(e) { log('[broadway] sprop pre-feed err: ' + e.message); }
+            }
+            prefeedSpropParams();
+
             function processH264Payload(ts, payload) {
               if (!payload || payload.length === 0) return;
               const nalType = payload[0] & 0x1F;
@@ -815,18 +849,22 @@
                                : n; // fallback: use sequence number as unique key
                       const seq = meta.sequenceNumber !== undefined ? meta.sequenceNumber : n;
                       // Filter: only forward PT=0 (H264 misidentified as PCMU).
-                      // PT=109 = Opus audio (real audio subscription artifact — should not arrive
-                      // here if audio is not subscribed, but guard just in case).
                       const pt = meta.payloadType;
+                      const ssrc = meta.synchronizationSource;
+                      // Periodic SSRC+PT diagnostic
+                      if (n % 1000 === 1)
+                        self.postMessage('periodic-meta pkt#' + n + ' ssrc=' + ssrc + ' pt=' + pt + ' sz=' + sz);
                       if (pt !== undefined && pt !== 0) {
                         // Not PT=0 — real audio codec, not H264 — skip
                         wr.write(value).then(pump).catch(() => pump());
                         return;
                       }
-                      // Log first few payload bytes for format diagnosis
-                      if (n <= 2 && value.data && value.data.byteLength >= 4) {
+                      // Log first few payload bytes + hex dump for format diagnosis
+                      if ((n <= 3 || n % 1000 === 1) && value.data && value.data.byteLength >= 4) {
                         const b = new Uint8Array(value.data);
-                        self.postMessage('audio-pkt#' + n + ' bytes[0..3]=' + Array.from(b.slice(0,4)).map(x=>x.toString(16).padStart(2,'0')).join(' ') + ' ts=' + ts);
+                        const hexDump = Array.from(b.slice(0, Math.min(32, b.length)))
+                          .map(x=>x.toString(16).padStart(2,'0')).join(' ');
+                        self.postMessage('hex-dump pkt#' + n + ' [' + hexDump + ']');
                       }
                       const payload = new Uint8Array(value.data).slice();
                       self.postMessage({ts: ts, seq: seq, data: payload}, [payload.buffer]);
@@ -878,6 +916,8 @@
                       await rtcClient.unsubscribe(user);
                       await new Promise(r => setTimeout(r, 600));
                       await rtcClient.subscribe(user, 'video');
+                      // Re-feed SPS+PPS from SDP so Broadway is ready for the new stream
+                      prefeedSpropParams();
                       log('[broadway] IDR recovery: resubscribed → expect SPS+PPS+IDR');
                     } catch(e) {
                       log('[broadway] IDR recovery resubscribe failed: ' + e.message);
