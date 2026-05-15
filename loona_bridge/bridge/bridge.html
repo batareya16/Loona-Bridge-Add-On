@@ -683,6 +683,7 @@
             // STAP-A (type 24, multiple NALs in one packet), or
             // FU-A (type 28, one NAL fragmented across multiple packets).
             const fuBufs = {};  // timestamp → Uint8Array (growing Annex B buffer)
+            let _seenNalTypes = {};
 
             function feedNAL(nal) {
               const ab = new Uint8Array(4 + nal.length);
@@ -694,6 +695,13 @@
             function processH264Payload(ts, payload) {
               if (!payload || payload.length === 0) return;
               const nalType = payload[0] & 0x1F;
+
+              // Log each new NAL type once for diagnosis
+              if (!_seenNalTypes[nalType]) {
+                _seenNalTypes[nalType] = true;
+                log('[broadway] new nalType=' + nalType + ' firstBytes=' +
+                  Array.from(payload.slice(0, Math.min(6, payload.length))).map(x=>x.toString(16).padStart(2,'0')).join(' ') + ' ts=' + ts);
+              }
 
               if (nalType >= 1 && nalType <= 23) {
                 feedNAL(payload);
@@ -751,15 +759,33 @@
                   const rd = transformer.readable.getReader();
                   const wr = transformer.writable.getWriter();
                   let n = 0;
+                  let metaLogged = false;
                   (function pump() {
                     rd.read().then(({done, value}) => {
                       if (done) { self.postMessage('audio-xform-done'); return; }
                       n++;
+                      const sz = value.data ? value.data.byteLength : 0;
                       if (n <= 3 || n % 300 === 0)
-                        self.postMessage('audio-pkt#' + n + ' sz=' + (value.data ? value.data.byteLength : 0));
+                        self.postMessage('audio-pkt#' + n + ' sz=' + sz);
                       const meta = value.getMetadata();
+                      // Log metadata keys once to discover field names in this Firefox version
+                      if (!metaLogged && meta) {
+                        metaLogged = true;
+                        self.postMessage('audio-meta-keys: ' + Object.keys(meta).join(','));
+                        self.postMessage('audio-meta: ' + JSON.stringify(meta));
+                      }
+                      // Firefox may expose rtpTimestamp as 'rtpTimestamp' or 'timestamp'
+                      const ts = (meta.rtpTimestamp !== undefined) ? meta.rtpTimestamp
+                               : (meta.timestamp     !== undefined) ? meta.timestamp
+                               : n; // fallback: use sequence number as unique key
+                      const seq = meta.sequenceNumber !== undefined ? meta.sequenceNumber : n;
+                      // Log first few payload bytes for format diagnosis
+                      if (n <= 2 && value.data && value.data.byteLength >= 4) {
+                        const b = new Uint8Array(value.data);
+                        self.postMessage('audio-pkt#' + n + ' bytes[0..3]=' + Array.from(b.slice(0,4)).map(x=>x.toString(16).padStart(2,'0')).join(' ') + ' ts=' + ts);
+                      }
                       const payload = new Uint8Array(value.data).slice();
-                      self.postMessage({ts: meta.rtpTimestamp, seq: meta.sequenceNumber, data: payload}, [payload.buffer]);
+                      self.postMessage({ts: ts, seq: seq, data: payload}, [payload.buffer]);
                       wr.write(value).then(pump).catch(() => pump());
                     }).catch(e => self.postMessage('audio-xform-err ' + e));
                   })();
@@ -1034,9 +1060,17 @@
           const raw = msg && msg.rawMessage;
           if (raw) {
             const u8 = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
-            let cmd = -1;
-            if (u8.length >= 8) cmd = new DataView(u8.buffer, u8.byteOffset, u8.byteLength).getInt32(4, true);
-            log('RTM<- cmd=' + cmd + ' bytes=' + u8.length);
+            // Robot sends [CMD:4LE][BODY:N] — NO length prefix (unlike app→robot which adds LENGTH).
+            // Previous bug: reading at offset 4 (treating it as [LENGTH][CMD]) → wrong cmd logged.
+            let cmd = -1, subcmd = -1;
+            const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+            if (u8.length >= 4) cmd = dv.getInt32(0, true);
+            if (u8.length >= 8) subcmd = dv.getInt32(4, true);
+            // cmd=404 = GAME_ERROR status; subcmd=40000=robot fell, subcmd=50000=robot stood up
+            // cmd=100900 + subcmd=500 = askVersion response (version data follows at byte 8+)
+            const label = (cmd === 404) ? ('status/body=' + subcmd) :
+                          (cmd === 100900 && subcmd === 500) ? 'askVersion-response' : '';
+            log('RTM<- cmd=' + cmd + (subcmd !== -1 ? ' sub=' + subcmd : '') + ' bytes=' + u8.length + (label ? ' [' + label + ']' : ''));
             if (ws.readyState === 1) {
               try {
                 ws.send(JSON.stringify({type: 'rtm', peer: peerId, cmd, bytes: Array.from(u8)}));
