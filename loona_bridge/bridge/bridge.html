@@ -105,30 +105,33 @@
       // ── PT=0 → H264 alias injector ──────────────────────────────────────────
       // ROOT CAUSE (v0.1.55): Agora edge sends H264 video RTP with PT=0
       // (RFC 3551 static PCMU assignment) instead of negotiated PT=97/126.
-      // Firefox demultiplexes by SSRC → m-section → PT lookup within section.
-      // PT=0 has no entry in video m-section → codecId=NONE → depacketizer never
-      // starts → jitterBufferEmittedCount=0 → framesReceived=0 forever.
       //
-      // v0.1.56: added PT=0 to video section in all SDPs → Firefox API showed
-      // [recv-params] video pt=0 mime=video/H264, BUT getStats() returned
-      // "no codec entries" — PT=0 in both audio (PCMU/8000) and video (H264/90000)
-      // m-sections → Firefox flat-codec-table conflict → neither registered.
+      // v0.1.56: PT=0 in video section → [recv-params] pt=0 mime=video/H264 ✓
+      //   BUT PT=0 in BOTH audio (PCMU/8000) and video (H264/90000) m-sections →
+      //   Firefox flat-codec-table conflict → no codec entries in getStats() AND
+      //   SSRC=40000 routed to audio path → xform readable empty → no frames.
       //
-      // v0.1.57: also stripped PT=0 from audio → edge got answer without PCMU →
-      // Agora edge stopped sending video → trk.muted=true, bytes=0 (regression).
+      // v0.1.57: stripped PT=0 from audio everywhere → edge got answer without
+      //   PCMU → stopped sending video → trk.muted=true, bytes=0 (regression).
       //
-      // v0.1.58 PLAN (this version):
-      //   createAnswer / setRemoteDescription:
-      //     • add PT=0 to VIDEO section only; keep audio untouched (patchAudio=false)
-      //     • edge gets answer WITH PCMU in audio → keeps sending video ✓
-      //   setLocalDescription:
-      //     • add PT=0 to VIDEO section AND evict PT=0 from audio (patchAudio=true)
-      //     • Firefox local state: PT=0 only in video → no codec-table conflict ✓
-      //   Result: negotiated audio codec set excludes PT=0 (local answer has no PCMU)
-      //   → getStats() has unambiguous video/H264 for PT=0 → codecId resolved ✓
+      // v0.1.58: patchAudio=true only in setLocalDescription → still trk.muted=true.
+      //   Root cause: Agora SDK reads pc.localDescription after it's set; detecting
+      //   PCMU gone causes session teardown regardless of what createAnswer returned.
       //
-      // patchAudio=false (default): add PT=0 to video only, do NOT touch audio.
-      // patchAudio=true: ALSO evict PT=0 from audio section.
+      // v0.1.59 PLAN (this version):
+      //   SSRC-BASED FIX: Firefox demux is SSRC-first, PT-second.
+      //   Remote offer likely declares a=ssrc:40000 in audio m-section (explains
+      //   why stats show ssrc=40000 kind=audio in v0.1.55/0.1.56 even when bytes
+      //   are flowing). OR: no ssrc lines → Firefox falls back to PT=0=PCMU static.
+      //   Either way: inject a=ssrc:40000 cname:loona-video into VIDEO section and
+      //   strip any a=ssrc:40000 from AUDIO section of remote offer.
+      //   This forces Firefox SSRC→m-section lookup to route SSRC=40000 to video.
+      //   → jitter buffer gets packets → frames emitted → xform readable fills ✓
+      //
+      //   Audio answer (PCMU): keep PT=0 in ALL SDPs (patchAudio always false).
+      //   Agora edge still gets PCMU in answer → keeps sending video ✓
+      //
+      // patchAudio=false (only value used): add PT=0 to video only, do NOT touch audio.
       function addPt0AsH264(sdp, patchAudio) {
         if (!/m=video/.test(sdp)) return sdp;  // no video section — skip
         const sep = sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
@@ -189,6 +192,62 @@
         return out.join(sep);
       }
 
+      // ── SSRC=40000 → video section mover ────────────────────────────────────
+      // Firefox SSRC-first demux: when remote SDP declares a=ssrc:40000 in the
+      // audio m-section (common when Agora edge mis-maps the video SSRC), ALL
+      // packets with SSRC=40000 go to the audio receiver regardless of PT.
+      // If no a=ssrc lines at all: Firefox falls back to PT=0=PCMU (RFC 3551
+      // static table) → same result: video packets fed to audio pipeline.
+      // Fix: strip a=ssrc:40000 from audio, inject into video.
+      // Applied to remote offer only (setRemoteDescription).
+      function fixSsrc40000(sdp) {
+        const sep  = sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
+        const lines = sdp.split(sep);
+        // Collect a=ssrc:40000 lines found anywhere (any m-section)
+        const ssrcLines = lines.filter(l => /^a=ssrc:40000\b/.test(l));
+        if (ssrcLines.length > 0) {
+          ssrcLines.forEach(l => console.log('[sdp-ssrc] found: ' + l));
+        } else {
+          console.log('[sdp-ssrc] no a=ssrc:40000 in remote offer — will inject cname');
+        }
+        // Build toInject: use found lines, or synthesize a cname entry
+        const toInject = ssrcLines.length > 0
+          ? ssrcLines
+          : ['a=ssrc:40000 cname:loona-video'];
+        const out = [];
+        let inAud = false, inVid = false;
+        for (const l of lines) {
+          if (/^m=/.test(l)) { inAud = /^m=audio/.test(l); inVid = /^m=video/.test(l); }
+          // Drop a=ssrc:40000 from everywhere (will re-add only to video)
+          if (/^a=ssrc:40000\b/.test(l)) {
+            console.log('[sdp-ssrc] removed from ' + (inAud ? 'audio' : inVid ? 'video' : '?') + ': ' + l.slice(0, 60));
+            continue;
+          }
+          out.push(l);
+        }
+        // Find end of video section and splice in the ssrc lines
+        let insertIdx = -1;
+        inVid = false;
+        for (let i = 0; i < out.length; i++) {
+          if (/^m=/.test(out[i])) {
+            if (inVid) { insertIdx = i; inVid = false; }
+            if (/^m=video/.test(out[i])) inVid = true;
+          }
+        }
+        if (inVid) {
+          let last = out.length - 1;
+          while (last >= 0 && out[last] === '') last--;
+          insertIdx = last + 1;
+        }
+        if (insertIdx >= 0) {
+          out.splice(insertIdx, 0, ...toInject);
+          console.log('[sdp-ssrc] injected ' + toInject.length + ' a=ssrc:40000 line(s) into video section');
+        } else {
+          console.log('[sdp-ssrc] WARNING: no video section found — ssrc not injected');
+        }
+        return out.join(sep);
+      }
+
       // Patch createAnswer() — ensures SDP is modified BEFORE setLocalDescription
       // sees it, regardless of whether setLocalDescription is called with or without args.
       const origCreateAnswer = RTCPeerConnection.prototype.createAnswer;
@@ -239,10 +298,12 @@
             // Strip sps-pps-idr-in-keyframe — Firefox must not see this in local SDP.
             const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
             const strippedIt = (stripped !== init.sdp);
-            // Add PT=0 as H264 alias to video AND evict PT=0 from audio (patchAudio=true).
-            // Local SDP must have PT=0 ONLY in video so Firefox codec table is unambiguous.
-            // The answer already sent to the edge (via createAnswer) keeps PCMU in audio.
-            const withPt0 = addPt0AsH264(stripped, true);
+            // patchAudio=false: keep PCMU (PT=0) in audio section of local SDP.
+            // Agora SDK reads pc.localDescription after setLocalDescription resolves;
+            // removing PCMU causes it to tear down the video session (trk.muted=true).
+            // SSRC demux fix (fixSsrc40000 in setRemoteDescription) routes packets
+            // correctly without needing to remove PCMU from local SDP.
+            const withPt0 = addPt0AsH264(stripped, false);
             // Profile downgrade only ('local' role — no sps-pps re-injection).
             const patched = injectSpsParam(withPt0, 'local');
             console.log('[sdp-patch] ' + method + ': H264=' + hasH264 +
@@ -289,9 +350,8 @@
         };
       }
       wrapSetDesc(RTCPeerConnection.prototype, 'setLocalDescription');
-      // setRemoteDescription: log robot's offer, strip sps-pps-idr-in-keyframe.
-      // Firefox's depacketizer may also change behaviour based on this param in the
-      // REMOTE SDP → strip here too so neither side's SDP has it.
+      // setRemoteDescription: log robot's offer, strip sps-pps-idr-in-keyframe,
+      // add PT=0 alias to video section, and fix SSRC demux routing.
       const origSetRemoteDesc = RTCPeerConnection.prototype.setRemoteDescription;
       RTCPeerConnection.prototype.setRemoteDescription = function(init) {
         if (init && init.sdp) {
@@ -299,21 +359,28 @@
           const fmtpLines = init.sdp.match(/a=fmtp:\d+[^\r\n]+/g) || [];
           if (mvLine) {
             console.log('[sdp-offer] ' + mvLine[0]);
-            // Log rtpmap lines (shows PT→codec mapping the robot uses)
+            // Log ALL rtpmap lines (PT→codec mapping for both audio and video)
             (init.sdp.match(/a=rtpmap:\d+[^\r\n]+/g) || [])
               .forEach(l => console.log('[sdp-offer] ' + l));
           }
           fmtpLines.forEach(l => console.log('[sdp-offer] ' + l));
-          // Strip sps-pps-idr-in-keyframe from robot's offer (robust regex).
+          // Log audio m-section (key: shows if a=ssrc:40000 is declared in audio)
+          const sep0 = init.sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
+          let inAud0 = false;
+          for (const l of init.sdp.split(sep0)) {
+            if (/^m=/.test(l)) inAud0 = /^m=audio/.test(l);
+            if (inAud0) console.log('[sdp-offer-aud] ' + l);
+          }
+          // Strip sps-pps-idr-in-keyframe from robot's offer.
           const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
           if (stripped !== init.sdp)
             console.log('[sdp-offer] stripped sps-pps-idr-in-keyframe from remote offer');
-          // Add PT=0 as H264 alias to remote SDP's video section only.
-          // patchAudio=false: do NOT remove PCMU from remote audio — edge must
-          // see its own offer reflected back correctly (audio conflict resolved by
-          // setLocalDescription removing PCMU from the local answer instead).
+          // Add PT=0 as H264 alias to video section (patchAudio=false: keep PCMU in audio).
           const withPt0 = addPt0AsH264(stripped, false);
-          if (withPt0 !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: withPt0 });
+          // Fix SSRC demux: move a=ssrc:40000 from audio → video section so Firefox
+          // routes SSRC=40000 packets to video receiver instead of audio.
+          const withSsrc = fixSsrc40000(withPt0);
+          if (withSsrc !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: withSsrc });
         }
         return origSetRemoteDesc.apply(this, arguments);
       };
