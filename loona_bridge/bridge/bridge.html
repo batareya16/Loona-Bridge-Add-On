@@ -102,100 +102,24 @@
         );
       }
 
-      // ── PT=0 → H264 alias injector ──────────────────────────────────────────
-      // ROOT CAUSE (v0.1.55): Agora edge sends H264 video RTP with PT=0
-      // (RFC 3551 static PCMU assignment) instead of negotiated PT=97/126.
+      // ── PT=0 aliasing REMOVED (v0.1.61) ─────────────────────────────────────
+      // PT=0 is a STATIC payload type (PCMU/8000) per RFC 3551.
+      // RFC 4566 §6: for static PTs the a=rtpmap line is OPTIONAL and
+      // implementations MAY ignore it.  Firefox does exactly this:
+      // it treats PT=0 as PCMU/8000 regardless of our a=rtpmap:0 H264/90000
+      // injection → Firefox sees an audio codec in the video m-section →
+      // codec table resolution fails → getStats() returns no codec entries →
+      // depacketizer never starts → jitter buffer stays empty forever.
       //
-      // v0.1.56: PT=0 in video section → [recv-params] pt=0 mime=video/H264 ✓
-      //   BUT PT=0 in BOTH audio (PCMU/8000) and video (H264/90000) m-sections →
-      //   Firefox flat-codec-table conflict → no codec entries → packets DROPPED.
+      // Evidence: "[stats-codec] no codec entries in getStats()" with
+      //   "[xform] xform-event fired" but zero "[xform] frame#N" entries:
+      //   the RTCRtpScriptTransform pipeline started but its readable is empty —
+      //   consistent with zero packets being depacketized due to no codec.
       //
-      // v0.1.57: stripped PT=0 from audio everywhere → edge answer sans PCMU →
-      //   stopped sending video → trk.muted=true, bytes=0 (regression).
-      //
-      // v0.1.58: patchAudio=true only in setLocalDescription → still trk.muted=true.
-      //   Agora SDK reads pc.localDescription post-set; PCMU gone → teardown.
-      //
-      // v0.1.59: SSRC=40000 was already in VIDEO section (confirmed by logs).
-      //   fixSsrc40000 is a no-op for that session. bytes=0 confirmed: SSRC routing
-      //   now correctly targets video path, but codec conflict drops all packets
-      //   (0.1.56 "bytes>0" was packets accepted by audio path → counted as audio).
-      //
-      // v0.1.60 PLAN (this version):
-      //   SPLIT THE SIGNAL:
-      //   • setRemoteDescription: strip PT=0 from audio (patchAudio=true) + add to
-      //     video → Firefox remote offer has PT=0 ONLY in video → no conflict ✓
-      //     createAnswer generates local answer without PT=0 in audio (echo of offer).
-      //   • pc.localDescription JS getter override: re-adds PT=0=PCMU to the audio
-      //     section of the stored local SDP before returning it to JS callers.
-      //     Agora SDK reads pc.localDescription and sends to edge → edge sees PCMU
-      //     in audio → keeps sending video ✓
-      //     Firefox C++ internals use stored SDP directly (not JS getter) → codec
-      //     table sees PT=0 only in video → no conflict → codec resolves ✓
-      //   • fixSsrc40000: keeps SSRC=40000 in video section for SSRC-based demux ✓
-      //
-      // patchAudio: used in addPt0AsH264.
-      //   false = add PT=0 to video only (used in createAnswer, setLocalDescription).
-      //   true  = also evict PT=0 from audio (used in setRemoteDescription).
-      function addPt0AsH264(sdp, patchAudio) {
-        if (!/m=video/.test(sdp)) return sdp;  // no video section — skip
-        const sep = sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
-        const lines = sdp.split(sep);
-        const out = [];
-        let inVid = false, inAud = false;
-        for (const l of lines) {
-          if (/^m=/.test(l)) { inVid = /^m=video/.test(l); inAud = /^m=audio/.test(l); }
-          // Audio section — evict PT=0 (PCMU) only when patchAudio=true
-          if (patchAudio && inAud) {
-            if (/^a=(rtpmap|fmtp|rtcp-fb):0\b/.test(l)) {
-              console.log('[sdp-pt0] dropped from audio: ' + l.slice(0, 60));
-              continue;
-            }
-            if (/^m=audio/.test(l)) {
-              const parts = l.split(' ');
-              const pts   = parts.slice(3).filter(p => p !== '0');
-              out.push(parts.slice(0, 3).concat(pts).join(' '));
-              console.log('[sdp-pt0] PT=0 removed from m=audio payload list');
-              continue;
-            }
-          }
-          // Video section — drop existing PT=0 a= (will re-add with H264 params)
-          if (inVid && /^a=(rtpmap|fmtp|rtcp-fb):0\b/.test(l)) continue;
-          // Video m= line — insert PT=0 into payload type list
-          if (/^m=video/.test(l)) {
-            const parts = l.split(' ');
-            if (!parts.slice(3).includes('0')) {
-              parts.splice(3, 0, '0');
-              console.log('[sdp-pt0] PT=0 inserted in m=video payload list');
-            }
-            out.push(parts.join(' '));
-          } else {
-            out.push(l);
-          }
-        }
-        // Locate end of video section and splice in PT=0 rtpmap+fmtp
-        let insertIdx = -1;
-        inVid = false;
-        for (let i = 0; i < out.length; i++) {
-          if (/^m=/.test(out[i])) {
-            if (inVid) { insertIdx = i; inVid = false; }
-            if (/^m=video/.test(out[i])) inVid = true;
-          }
-        }
-        if (inVid) {
-          let last = out.length - 1;
-          while (last >= 0 && out[last] === '') last--;
-          insertIdx = last + 1;
-        }
-        if (insertIdx >= 0) {
-          out.splice(insertIdx, 0,
-            'a=rtpmap:0 H264/90000',
-            'a=fmtp:0 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1'
-          );
-          console.log('[sdp-pt0] a=rtpmap:0 H264/90000 + a=fmtp:0 H264 inserted in video section');
-        }
-        return out.join(sep);
-      }
+      // Fix: remove all addPt0AsH264 calls and the reAddAudioPcmu / localDescription
+      // getter hack.  Let Firefox negotiate H264 on dynamic PTs (PT=126/PT=97)
+      // as normal.  If edge truly sends H264 on PT=0, we'll see bytes>0 on the
+      // audio inbound-rtp entry and can handle it differently.
 
       // ── SSRC=40000 → video section mover ────────────────────────────────────
       // Firefox SSRC-first demux: when remote SDP declares a=ssrc:40000 in the
@@ -253,72 +177,9 @@
         return out.join(sep);
       }
 
-      // ── PCMU re-injector for pc.localDescription (Agora signaling only) ────────
-      // Firefox stores local answer WITHOUT PT=0 in audio (stripped by patchAudio=true
-      // in setRemoteDescription → createAnswer echo → no PT=0 in audio answer).
-      // Agora SDK reads pc.localDescription to send the answer to the edge.
-      // The edge requires PT=0=PCMU in the audio answer or it stops sending video.
-      // This function adds PT=0=PCMU back ONLY for JS-level reads of localDescription;
-      // Firefox C++ never calls JS getters, so its internal codec table stays clean.
-      function reAddAudioPcmu(sdp) {
-        if (!/m=audio/.test(sdp)) return sdp;
-        const sep = sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
-        const lines = sdp.split(sep);
-        // Check if PT=0 is already in the audio m= payload list
-        for (const l of lines) {
-          if (/^m=audio/.test(l)) {
-            const pts = l.split(' ').slice(3);
-            if (pts.includes('0')) return sdp; // already present — nothing to do
-            break;
-          }
-        }
-        const out = [];
-        let inserted = false;
-        for (let i = 0; i < lines.length; i++) {
-          const l = lines[i];
-          if (!inserted && /^m=audio/.test(l)) {
-            // Add PT=0 as first payload type in m=audio
-            const p = l.split(' ');
-            p.splice(3, 0, '0');
-            out.push(p.join(' '));
-            // Insert a=rtpmap immediately after m=audio line
-            out.push('a=rtpmap:0 PCMU/8000');
-            inserted = true;
-            console.log('[sdp-local-getter] PCMU/PT=0 re-added to audio for Agora→edge');
-            continue;
-          }
-          out.push(l);
-        }
-        return out.join(sep);
-      }
-
-      // Override pc.localDescription JS getter.
-      // JavaScript callers (Agora SDK) see the PCMU-restored version.
-      // Firefox C++ (codec table, ICE, DTLS) reads internal slots directly —
-      // JS getter override has zero effect on Firefox-internal operations.
-      (function patchLocalDescGetter() {
-        const proto = RTCPeerConnection.prototype;
-        const desc  = Object.getOwnPropertyDescriptor(proto, 'localDescription');
-        if (!desc || !desc.get) {
-          console.log('[sdp-patch] localDescription getter not found — skipping');
-          return;
-        }
-        Object.defineProperty(proto, 'localDescription', {
-          get() {
-            const ld = desc.get.call(this);
-            if (!ld || !ld.sdp) return ld;
-            // Only bother patching if this PC has H264 (video PC)
-            if (!/H264|h264/i.test(ld.sdp)) return ld;
-            const patched = reAddAudioPcmu(ld.sdp);
-            if (patched === ld.sdp) return ld;
-            // Return plain object — Agora only reads .type and .sdp
-            return { type: ld.type, sdp: patched };
-          },
-          configurable: true,
-          enumerable:   true
-        });
-        console.log('[sdp-patch] localDescription getter patched (PCMU restore for Agora)');
-      })();
+      // ── PCMU localDescription getter REMOVED (v0.1.61) ──────────────────────
+      // No longer needed: we no longer strip PT=0 from audio in setRemoteDescription,
+      // so Agora edge always sees PCMU in the local answer without any getter trick.
 
       // Patch createAnswer() — ensures SDP is modified BEFORE setLocalDescription
       // sees it, regardless of whether setLocalDescription is called with or without args.
@@ -335,9 +196,9 @@
           // Reset per-PT log guard so every renegotiation logs fmtp details.
           Object.keys(_fmtpLogged).forEach(k => delete _fmtpLogged[k]);
 
-          // patchAudio=false: keep PCMU in audio answer — Agora edge requires it
-          const withPt0  = addPt0AsH264(answer.sdp, false);
-          const patched  = injectSpsParam(withPt0, 'answer');
+          // Profile downgrade + sps-pps-idr-in-keyframe injection only.
+          // PT=0 aliasing removed (v0.1.61) — see comment above.
+          const patched  = injectSpsParam(answer.sdp, 'answer');
           if (patched !== answer.sdp) {
             console.log('[sdp-patch] createAnswer: patched H.264 fmtp + PT=0 H264 alias in answer SDP');
             return new RTCSessionDescription({ type: answer.type, sdp: patched });
@@ -370,14 +231,9 @@
             // Strip sps-pps-idr-in-keyframe — Firefox must not see this in local SDP.
             const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
             const strippedIt = (stripped !== init.sdp);
-            // patchAudio=false: keep PCMU (PT=0) in audio section of local SDP.
-            // Agora SDK reads pc.localDescription after setLocalDescription resolves;
-            // removing PCMU causes it to tear down the video session (trk.muted=true).
-            // SSRC demux fix (fixSsrc40000 in setRemoteDescription) routes packets
-            // correctly without needing to remove PCMU from local SDP.
-            const withPt0 = addPt0AsH264(stripped, false);
+            // PT=0 aliasing removed (v0.1.61) — no addPt0AsH264 here.
             // Profile downgrade only ('local' role — no sps-pps re-injection).
-            const patched = injectSpsParam(withPt0, 'local');
+            const patched = injectSpsParam(stripped, 'local');
             console.log('[sdp-patch] ' + method + ': H264=' + hasH264 +
               (strippedIt ? ' stripped sps-pps-idr-in-keyframe' : '') +
               (patched !== stripped ? ' → PATCHED (profile downgrade/PT=0)' :
@@ -447,12 +303,9 @@
           const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
           if (stripped !== init.sdp)
             console.log('[sdp-offer] stripped sps-pps-idr-in-keyframe from remote offer');
-          // Strip PT=0 from audio (patchAudio=true) AND add PT=0=H264 to video.
-          // Remote offer has PT=0 ONLY in video section → no flat-codec-table conflict.
-          // pc.localDescription getter (see above) re-adds PCMU for Agora→edge signaling.
-          const withPt0 = addPt0AsH264(stripped, true);
+          // PT=0 aliasing removed (v0.1.61) — no addPt0AsH264 here.
           // Fix SSRC demux: ensure a=ssrc:40000 is in video section.
-          const withSsrc = fixSsrc40000(withPt0);
+          const withSsrc = fixSsrc40000(stripped);
           if (withSsrc !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: withSsrc });
         }
         return origSetRemoteDesc.apply(this, arguments);
@@ -737,19 +590,34 @@
         }
 
         // ── PC finder (used by frame-counter transform AND periodic stats) ─────
+        // Agora SDK uses two RTCPeerConnections internally (pub + sub).
+        // We must find the SUBSCRIBING PC — the one whose video receiver is live.
+        // Strategy: first scan for a PC that has a live video receiver (sub PC);
+        // fall back to the first PC found if none has a live video receiver.
         const isPC = (o) => o && typeof o === 'object' &&
           typeof o.getStats === 'function' && typeof o.getReceivers === 'function';
-        const findPC = (obj, d) => {
+        function findPC(obj, d, wantVideo) {
           if (d > 7 || !obj || typeof obj !== 'object') return null;
-          if (isPC(obj)) return obj;
+          if (isPC(obj)) {
+            if (!wantVideo) return obj;
+            try {
+              const hasLiveVideo = obj.getReceivers().some(
+                r => r.track && r.track.kind === 'video' && r.track.readyState === 'live'
+              );
+              if (hasLiveVideo) return obj;
+            } catch (_) {}
+            return null;
+          }
           try { for (const k of Object.keys(obj)) {
             try { const v = obj[k];
               if (v && typeof v === 'object' && !Array.isArray(v)) {
-                const r = findPC(v, d + 1); if (r) return r; }
+                const r = findPC(v, d + 1, wantVideo); if (r) return r; }
             } catch (_) {}
           }} catch (_) {}
           return null;
-        };
+        }
+        // Find sub PC first (has live video receiver); fall back to any PC.
+        const findBestPC = (obj) => findPC(obj, 0, true) || findPC(obj, 0, false);
 
         // Frame-counter RTCRtpScriptTransform:
         // If [xform] frame#N logs appear → jitter buffer IS assembling H264 frames
@@ -758,7 +626,7 @@
         //   bug (sps-pps-idr-in-keyframe or FU-A handling issue in Firefox 128).
         try {
           if (typeof RTCRtpScriptTransform !== 'undefined') {
-            const _pc = findPC(rtcClient, 0);
+            const _pc = findBestPC(rtcClient);
             const _vrecv = _pc && _pc.getReceivers &&
               _pc.getReceivers().find(r => r.track && r.track.kind === 'video');
             if (_vrecv) {
@@ -831,7 +699,7 @@
           statsCount++;
           let raw = {};
           try {
-            const pc = findPC(rtcClient, 0);
+            const pc = findBestPC(rtcClient);
             if (pc) {
               const report = await pc.getStats();
               // Build codec map (id → {mimeType, payloadType})
@@ -881,14 +749,29 @@
                   if (strVals) log('[stats-dbg#' + i + '-str] ' + strVals);
                 });
                 if (videoRx.length === 0) log('[stats-dbg] no inbound-rtp video entries in getStats()');
-                // Log non-video inbound-rtp entries (may reveal video on unexpected kind)
-                allRx.filter(r => r.kind !== 'video').forEach(r => {
+              // Log non-video inbound-rtp entries (may reveal video on unexpected kind)
+              allRx.filter(r => r.kind !== 'video').forEach(r => {
+                const codec = r.codecId && codecMap[r.codecId];
+                log('[stats-other-rx] ssrc=' + r.ssrc + ' kind=' + r.kind +
+                  ' codecId=' + (r.codecId || 'NONE') +
+                  (codec ? ' → ' + codec.mimeType + '/pt=' + codec.payloadType : '') +
+                  ' pkt=' + r.packetsReceived + ' bytes=' + r.bytesReceived);
+              });
+              // v0.1.61: always log ALL inbound-rtp entries (every stats interval)
+              // so we can see which SSRC/PT edge is actually using.
+              if (allRx.length === 0) {
+                log('[stats-all-rx] no inbound-rtp entries at all — packets not arriving?');
+              } else {
+                allRx.forEach(r => {
                   const codec = r.codecId && codecMap[r.codecId];
-                  log('[stats-other-rx] ssrc=' + r.ssrc + ' kind=' + r.kind +
-                    ' codecId=' + (r.codecId || 'NONE') +
-                    (codec ? ' → ' + codec.mimeType + '/pt=' + codec.payloadType : '') +
-                    ' pkt=' + r.packetsReceived + ' bytes=' + r.bytesReceived);
+                  log('[stats-all-rx] ssrc=' + r.ssrc + ' kind=' + r.kind +
+                    ' pt=' + (codec ? codec.payloadType : 'NONE') +
+                    ' mime=' + (codec ? codec.mimeType : 'NONE') +
+                    ' bytes=' + r.bytesReceived + ' pkt=' + r.packetsReceived +
+                    ' rx=' + (r.framesReceived != null ? r.framesReceived : '?') +
+                    ' dec=' + (r.framesDecoded != null ? r.framesDecoded : '?'));
                 });
+              }
               }
 
               // Log all video streams (there may be >1 SSRC)
