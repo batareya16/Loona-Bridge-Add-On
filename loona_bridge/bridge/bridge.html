@@ -108,20 +108,49 @@
       // Firefox demultiplexes by SSRC → m-section → PT lookup within section.
       // PT=0 has no entry in the video m-section → codecId=NONE → depacketizer
       // never starts → jitterBufferEmittedCount=0 → framesReceived=0 forever.
-      // FIX: insert  a=rtpmap:0 H264/90000  into the video m-section in BOTH
-      // remote (setRemoteDescription) and local (createAnswer/setLocalDescription)
-      // SDPs so Firefox maps incoming PT=0 packets to its H264 depacketizer.
+      //
+      // v0.1.56 FIRST ATTEMPT: added PT=0 to video section → Firefox reported
+      // [recv-params] video pt=0 mime=video/H264 at the API level, BUT
+      // [stats-codec] returned "no codec entries" — PT=0 now appeared in BOTH
+      // audio (PCMU/8000) and video (H264/90000) m-sections → Firefox conflict →
+      // demultiplexer registered neither codec → still codecId=NONE → still 0 frames.
+      //
+      // FIX (v0.1.57): ALSO strip PT=0 from the audio m-section to eliminate
+      // the conflict. After this: PT=0 exists only in video→H264/90000.
+      // Firefox can register a single unambiguous codec entry for PT=0 → H264,
+      // SSRC=40000 packets (currently counted as PCMU audio) route to H264
+      // depacketizer, jitter buffer emits, framesReceived > 0.
+      // (Audio subscription is explicitly skipped anyway — no user impact.)
       function addPt0AsH264(sdp) {
         if (!/m=video/.test(sdp)) return sdp;  // no video section — skip
         const sep = sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
         const lines = sdp.split(sep);
         const out = [];
-        let inVid = false;
-        // Pass 1: copy lines; add PT=0 to m=video payload list; drop any
-        // existing PT=0 a= lines in video section (idempotent — no duplicates)
+        let inVid = false, inAud = false;
+        // Pass 1: copy lines with three mutations:
+        //   • audio m= line: remove PT=0 from payload list
+        //   • audio a= lines for PT=0: drop entirely (no PCMU codec conflict)
+        //   • video m= line: add PT=0 to payload list
+        //   • video a= lines for PT=0: drop (will re-add with correct H264 params)
         for (const l of lines) {
-          if (/^m=/.test(l)) inVid = /^m=video/.test(l);
+          if (/^m=/.test(l)) { inVid = /^m=video/.test(l); inAud = /^m=audio/.test(l); }
+          // Audio section — evict PT=0 (PCMU) entirely
+          if (inAud) {
+            if (/^a=(rtpmap|fmtp|rtcp-fb):0\b/.test(l)) {
+              console.log('[sdp-pt0] dropped from audio: ' + l.slice(0, 60));
+              continue;
+            }
+            if (/^m=audio/.test(l)) {
+              const parts = l.split(' ');
+              const pts   = parts.slice(3).filter(p => p !== '0');
+              out.push(parts.slice(0, 3).concat(pts).join(' '));
+              console.log('[sdp-pt0] PT=0 removed from m=audio payload list');
+              continue;
+            }
+          }
+          // Video section — drop existing PT=0 a= (will re-add correctly below)
           if (inVid && /^a=(rtpmap|fmtp|rtcp-fb):0\b/.test(l)) continue;
+          // Video m= line — add PT=0
           if (/^m=video/.test(l)) {
             const parts = l.split(' ');
             if (!parts.slice(3).includes('0')) {
