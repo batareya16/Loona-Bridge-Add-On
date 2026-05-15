@@ -91,6 +91,50 @@
         );
       }
 
+      // Remove H264 PTs without packetization-mode=1 from answer SDP.
+      // When both PT=126 (packetization-mode=1 / FU-A) and PT=97 (packetization-mode=0 /
+      // single-NAL) are present, Firefox 128 may initialise the H264 depacketizer with
+      // the wrong fmtp params → jitterBufferEmittedCount=0, framesReceived=0 forever.
+      // Removing mode-0 PT forces Firefox to only see FU-A PT=126.
+      function stripDuplicateH264Pts(sdp) {
+        const hasCRLF = sdp.indexOf('\r\n') >= 0;
+        const sep = hasCRLF ? '\r\n' : '\n';
+        const lines = sdp.split(sep);
+        // Collect H264 PTs without packetization-mode=1 (i.e. mode=0 / single-NAL)
+        const h264NoPMPts = new Set();
+        lines.forEach(l => {
+          const m = l.match(/^a=fmtp:(\d+) (.+)/);
+          if (!m) return;
+          const [, pt, params] = m;
+          if (/profile-level-id=/i.test(params) && !/packetization-mode=1/.test(params)) {
+            h264NoPMPts.add(pt);
+          }
+        });
+        if (h264NoPMPts.size === 0) return sdp;
+        // Collect RTX PTs that reference the no-PM1 H264 PTs (apt=<pt>)
+        const removePts = new Set(h264NoPMPts);
+        lines.forEach(l => {
+          const m = l.match(/^a=fmtp:(\d+) apt=(\d+)/);
+          if (m && removePts.has(m[2])) removePts.add(m[1]);
+        });
+        console.log('[sdp-simplify] removing H264 no-PM1 PTs from answer: ' + [...removePts].join(','));
+        const newLines = [];
+        for (const l of lines) {
+          // Drop a=fmtp/rtpmap/rtcp-fb for removed PTs
+          const aMatch = l.match(/^a=(?:fmtp|rtpmap|rtcp-fb):(\d+)/);
+          if (aMatch && removePts.has(aMatch[1])) continue;
+          // Strip removed PTs from m=video PT list
+          if (/^m=video/.test(l)) {
+            const parts = l.split(' ');
+            // parts[0]='m=video', parts[1]=port, parts[2]=proto, parts[3+]=PTs
+            newLines.push(parts.filter((p, i) => i < 3 || !removePts.has(p)).join(' '));
+            continue;
+          }
+          newLines.push(l);
+        }
+        return newLines.join(sep);
+      }
+
       // Patch createAnswer() — ensures SDP is modified BEFORE setLocalDescription
       // sees it, regardless of whether setLocalDescription is called with or without args.
       const origCreateAnswer = RTCPeerConnection.prototype.createAnswer;
@@ -98,7 +142,6 @@
         const answer = await origCreateAnswer.apply(this, args);
         if (answer && answer.sdp) {
           // Log full m=video + all fmtp lines BEFORE any patching, every renegotiation.
-          // Helps diagnose: missing packetization-mode=1, wrong profile, etc.
           const mvLine = answer.sdp.match(/m=video[^\r\n]+/);
           const fmtpLines = answer.sdp.match(/a=fmtp:\d+[^\r\n]+/g) || [];
           if (mvLine) console.log('[sdp-ca-raw] ' + mvLine[0]);
@@ -107,14 +150,17 @@
           // Reset per-PT log guard so every renegotiation logs fmtp details.
           Object.keys(_fmtpLogged).forEach(k => delete _fmtpLogged[k]);
 
-          const patched = injectSpsParam(answer.sdp, 'answer');
+          // 1) Inject sps-pps-idr-in-keyframe + profile downgrade into answer
+          const patched1 = injectSpsParam(answer.sdp, 'answer');
+          // 2) Remove duplicate H264 PTs (packetization-mode=0) from answer
+          const patched = stripDuplicateH264Pts(patched1);
           if (patched !== answer.sdp) {
             console.log('[sdp-patch] createAnswer: patched H.264 fmtp in answer SDP');
             return new RTCSessionDescription({ type: answer.type, sdp: patched });
           } else {
             const hasH264 = /H264|h264/i.test(answer.sdp);
             console.log('[sdp-patch] createAnswer: H264=' + hasH264 +
-              (hasH264 ? ' no profile patch needed' : ' (no H264 in answer)'));
+              (hasH264 ? ' no patch needed' : ' (no H264 in answer)'));
           }
         }
         return answer;
@@ -128,10 +174,11 @@
       function wrapSetDesc(proto, method) {
         const orig = proto[method];
         proto[method] = function(init) {
+          const pc = this;
           if (init && init.sdp) {
             const hasH264 = /H264|h264/i.test(init.sdp);
             // Strip sps-pps-idr-in-keyframe — Firefox must not see this in local SDP.
-            const stripped = init.sdp.replace(/;sps-pps-idr-in-keyframe=\d/g, '');
+            const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
             const strippedIt = (stripped !== init.sdp);
             // Profile downgrade only ('local' role — no sps-pps re-injection).
             const patched = injectSpsParam(stripped, 'local');
@@ -139,17 +186,36 @@
               (strippedIt ? ' stripped sps-pps-idr-in-keyframe' : '') +
               (patched !== stripped ? ' → PATCHED (profile downgrade)' :
                (!strippedIt && hasH264) ? ' no patch needed' : ''));
-            if (patched !== init.sdp) {
-              return orig.call(this, { type: init.type, sdp: patched });
+            const p = (patched !== init.sdp)
+              ? orig.call(this, { type: init.type, sdp: patched })
+              : orig.apply(this, arguments);
+            // Log exactly what Firefox set as localDescription (confirm sps-pps gone).
+            if (p && typeof p.then === 'function') {
+              p.then(() => {
+                try {
+                  const ld = pc.localDescription;
+                  if (ld && ld.sdp && /m=video/.test(ld.sdp)) {
+                    const mv = ld.sdp.match(/m=video[^\r\n]+/);
+                    if (mv) console.log('[sdp-local-final] ' + mv[0]);
+                    (ld.sdp.match(/a=fmtp:\d+[^\r\n]+/g) || [])
+                      .forEach(l => console.log('[sdp-local-final] ' + l));
+                    const hasSps = /sps-pps-idr-in-keyframe/.test(ld.sdp);
+                    console.log('[sdp-local-final] sps-pps-idr-in-keyframe present=' + hasSps);
+                  }
+                } catch(e) {}
+              }).catch(() => {});
             }
+            return p;
           } else {
-            console.log('[sdp-patch] ' + method + ': called without sdp arg (implicit form — relying on createAnswer patch)');
+            console.log('[sdp-patch] ' + method + ': no-arg (implicit form)');
           }
           return orig.apply(this, arguments);
         };
       }
       wrapSetDesc(RTCPeerConnection.prototype, 'setLocalDescription');
-      // setRemoteDescription: log robot's offer m=video + fmtp (shows actual codec/profile/params).
+      // setRemoteDescription: log robot's offer, strip sps-pps-idr-in-keyframe.
+      // Firefox's depacketizer may also change behaviour based on this param in the
+      // REMOTE SDP → strip here too so neither side's SDP has it.
       const origSetRemoteDesc = RTCPeerConnection.prototype.setRemoteDescription;
       RTCPeerConnection.prototype.setRemoteDescription = function(init) {
         if (init && init.sdp) {
@@ -157,8 +223,12 @@
           const fmtpLines = init.sdp.match(/a=fmtp:\d+[^\r\n]+/g) || [];
           if (mvLine) console.log('[sdp-offer] ' + mvLine[0]);
           fmtpLines.forEach(l => console.log('[sdp-offer] ' + l));
-          const patched = injectSpsParam(init.sdp, 'remote');
-          if (patched !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: patched });
+          // Strip sps-pps-idr-in-keyframe from robot's offer (robust regex).
+          const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
+          if (stripped !== init.sdp)
+            console.log('[sdp-offer] stripped sps-pps-idr-in-keyframe from remote offer');
+          // Profile downgrade for remote SDP not needed (robot already uses CBP).
+          if (stripped !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: stripped });
         }
         return origSetRemoteDesc.apply(this, arguments);
       };
@@ -555,7 +625,7 @@
                 }
               });
 
-              // First interval: dump all fields for every video rx entry
+              // First interval: dump all fields + try requestKeyFrame if jitter empty
               if (statsCount === 1) {
                 videoRx.forEach((r, i) => {
                   const codec = r.codecId && codecMap[r.codecId];
@@ -571,6 +641,22 @@
                   if (strVals) log('[stats-dbg#' + i + '-str] ' + strVals);
                 });
                 if (videoRx.length === 0) log('[stats-dbg] no inbound-rtp video entries in getStats()');
+                // If jitter buffer still empty, prod it with requestKeyFrame()
+                // (Firefox 128+ RTCRtpReceiver API — forces PLI to robot)
+                if (raw.jbe === 0 && pc) {
+                  try {
+                    pc.getReceivers()
+                      .filter(r => r.track && r.track.kind === 'video')
+                      .forEach(r => {
+                        if (typeof r.requestKeyFrame === 'function') {
+                          r.requestKeyFrame();
+                          log('[rkf] requestKeyFrame() called on video receiver');
+                        } else {
+                          log('[rkf] requestKeyFrame() not available');
+                        }
+                      });
+                  } catch(e) { log('[rkf] error: ' + e.message); }
+                }
               }
 
               // Log all video streams (there may be >1 SSRC)
