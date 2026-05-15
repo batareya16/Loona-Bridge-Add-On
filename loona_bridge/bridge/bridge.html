@@ -102,6 +102,62 @@
         );
       }
 
+      // ── PT=0 → H264 alias injector ──────────────────────────────────────────
+      // ROOT CAUSE (v0.1.55): Agora edge sends H264 video RTP with PT=0
+      // (RFC 3551 static PCMU assignment) instead of negotiated PT=97/126.
+      // Firefox demultiplexes by SSRC → m-section → PT lookup within section.
+      // PT=0 has no entry in the video m-section → codecId=NONE → depacketizer
+      // never starts → jitterBufferEmittedCount=0 → framesReceived=0 forever.
+      // FIX: insert  a=rtpmap:0 H264/90000  into the video m-section in BOTH
+      // remote (setRemoteDescription) and local (createAnswer/setLocalDescription)
+      // SDPs so Firefox maps incoming PT=0 packets to its H264 depacketizer.
+      function addPt0AsH264(sdp) {
+        if (!/m=video/.test(sdp)) return sdp;  // no video section — skip
+        const sep = sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
+        const lines = sdp.split(sep);
+        const out = [];
+        let inVid = false;
+        // Pass 1: copy lines; add PT=0 to m=video payload list; drop any
+        // existing PT=0 a= lines in video section (idempotent — no duplicates)
+        for (const l of lines) {
+          if (/^m=/.test(l)) inVid = /^m=video/.test(l);
+          if (inVid && /^a=(rtpmap|fmtp|rtcp-fb):0\b/.test(l)) continue;
+          if (/^m=video/.test(l)) {
+            const parts = l.split(' ');
+            if (!parts.slice(3).includes('0')) {
+              parts.splice(3, 0, '0');
+              console.log('[sdp-pt0] PT=0 inserted in m=video payload list');
+            }
+            out.push(parts.join(' '));
+          } else {
+            out.push(l);
+          }
+        }
+        // Pass 2: locate end of video section and splice in PT=0 rtpmap+fmtp
+        let insertIdx = -1;
+        inVid = false;
+        for (let i = 0; i < out.length; i++) {
+          if (/^m=/.test(out[i])) {
+            if (inVid) { insertIdx = i; inVid = false; }  // insert before next m=
+            if (/^m=video/.test(out[i])) inVid = true;
+          }
+        }
+        if (inVid) {
+          // Video is the last section — insert before any trailing empty strings
+          let last = out.length - 1;
+          while (last >= 0 && out[last] === '') last--;
+          insertIdx = last + 1;
+        }
+        if (insertIdx >= 0) {
+          out.splice(insertIdx, 0,
+            'a=rtpmap:0 H264/90000',
+            'a=fmtp:0 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1'
+          );
+          console.log('[sdp-pt0] a=rtpmap:0 H264/90000 + a=fmtp:0 H264 inserted in video section');
+        }
+        return out.join(sep);
+      }
+
       // Patch createAnswer() — ensures SDP is modified BEFORE setLocalDescription
       // sees it, regardless of whether setLocalDescription is called with or without args.
       const origCreateAnswer = RTCPeerConnection.prototype.createAnswer;
@@ -117,9 +173,10 @@
           // Reset per-PT log guard so every renegotiation logs fmtp details.
           Object.keys(_fmtpLogged).forEach(k => delete _fmtpLogged[k]);
 
-          const patched = injectSpsParam(answer.sdp, 'answer');
+          const withPt0  = addPt0AsH264(answer.sdp);
+          const patched  = injectSpsParam(withPt0, 'answer');
           if (patched !== answer.sdp) {
-            console.log('[sdp-patch] createAnswer: patched H.264 fmtp in answer SDP');
+            console.log('[sdp-patch] createAnswer: patched H.264 fmtp + PT=0 H264 alias in answer SDP');
             return new RTCSessionDescription({ type: answer.type, sdp: patched });
           } else {
             const hasH264 = /H264|h264/i.test(answer.sdp);
@@ -150,11 +207,14 @@
             // Strip sps-pps-idr-in-keyframe — Firefox must not see this in local SDP.
             const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
             const strippedIt = (stripped !== init.sdp);
+            // Add PT=0 as H264 alias (safety net: ensures local SDP has PT=0→H264
+            // even if Agora SDK rewrites SDP between createAnswer and setLocalDesc).
+            const withPt0 = addPt0AsH264(stripped);
             // Profile downgrade only ('local' role — no sps-pps re-injection).
-            const patched = injectSpsParam(stripped, 'local');
+            const patched = injectSpsParam(withPt0, 'local');
             console.log('[sdp-patch] ' + method + ': H264=' + hasH264 +
               (strippedIt ? ' stripped sps-pps-idr-in-keyframe' : '') +
-              (patched !== stripped ? ' → PATCHED (profile downgrade)' :
+              (patched !== stripped ? ' → PATCHED (profile downgrade/PT=0)' :
                (!strippedIt && hasH264) ? ' no patch needed' : ''));
             const p = (patched !== init.sdp)
               ? orig.call(this, { type: init.type, sdp: patched })
@@ -215,7 +275,11 @@
           const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
           if (stripped !== init.sdp)
             console.log('[sdp-offer] stripped sps-pps-idr-in-keyframe from remote offer');
-          if (stripped !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: stripped });
+          // Add PT=0 as H264 alias to remote SDP's video section.
+          // Agora edge sends H264 video packets with PT=0; Firefox needs PT=0
+          // listed in the video m-section to correctly depacketize those frames.
+          const withPt0 = addPt0AsH264(stripped);
+          if (withPt0 !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: withPt0 });
         }
         return origSetRemoteDesc.apply(this, arguments);
       };
