@@ -551,7 +551,7 @@
 
       rtcClient.on('user-published', async (user, mediaType) => {
         if (mediaType === 'audio') {
-          // v0.1.67: Do NOT subscribe to audio.
+          // v0.1.67: Do NOT subscribe to audio. v0.1.68: IDR recovery added.
           // Key insight from v0.1.66 test: when audio IS subscribed, Agora negotiates
           // OPUS (pt=109) for audio, and the robot sends proper OPUS on SSRC=20000.
           // BUT the H264 video (SSRC=40000 PT=0) completely disappears — robot/edge stops
@@ -647,6 +647,9 @@
             const bwDecoder = new Decoder({ rgb: true });
             let bwFirstFrame = false;
             let lastBwSendTs = 0;
+            let bwPacketCount = 0;   // packets fed to processH264Payload
+            let bwHasIDR = false;    // true once we see nalType 5/7/8
+            let idrRetries = 0;      // how many times we've tried IDR recovery
 
             bwDecoder.onDecoderReady = function() {
               log('[broadway] ✓ WASM decoder ready (avc.wasm loaded)');
@@ -710,6 +713,15 @@
             function processH264Payload(ts, payload) {
               if (!payload || payload.length === 0) return;
               const nalType = payload[0] & 0x1F;
+              bwPacketCount++;
+
+              // IDR / SPS / PPS arrival — log every time (not just once)
+              if (nalType === 5 || nalType === 7 || nalType === 8) {
+                if (!bwHasIDR) {
+                  bwHasIDR = true;
+                  log('[broadway] ✓ IDR/SPS/PPS arrived: nalType=' + nalType + ' at pkt#' + bwPacketCount);
+                }
+              }
 
               // Log each new NAL type once for diagnosis
               if (!_seenNalTypes[nalType]) {
@@ -827,6 +839,48 @@
               };
               _audRecv.transform = new RTCRtpScriptTransform(audWorker);
               log('[broadway] RTCRtpScriptTransform installed on audio receiver (H264/PT=0 intercept)');
+
+              // ── IDR recovery: robot sends SPS+PPS+IDR only at stream start,
+              // before our transform is ready → we miss them → only P-frames arrive.
+              // Fix: after 2s with packets but no IDR, request a keyframe (RTCP PLI)
+              // and eventually force unsubscribe+subscribe so robot restarts stream.
+              function requestIDR() {
+                if (bwFirstFrame) return;
+                idrRetries++;
+                log('[broadway] IDR recovery #' + idrRetries +
+                  ': pkts=' + bwPacketCount + ' hasIDR=' + bwHasIDR);
+                // Attempt 1: RTCP PLI via requestKeyFrame() (Firefox WebRTC-extensions)
+                if (_audRecv && typeof _audRecv.requestKeyFrame === 'function') {
+                  try {
+                    _audRecv.requestKeyFrame();
+                    log('[broadway] requestKeyFrame() sent → waiting for IDR...');
+                  } catch(e) { log('[broadway] requestKeyFrame() err: ' + e.message); }
+                } else {
+                  log('[broadway] requestKeyFrame() not available in this Firefox');
+                }
+                // Attempt 2+: force unsubscribe+subscribe → robot restarts stream fresh
+                if (idrRetries >= 2) {
+                  log('[broadway] IDR recovery: forcing resubscription for new SPS+PPS+IDR burst...');
+                  fuBuf = null; bwHasIDR = false; bwPacketCount = 0;
+                  (async () => {
+                    try {
+                      await rtcClient.unsubscribe(user);
+                      await new Promise(r => setTimeout(r, 600));
+                      await rtcClient.subscribe(user, 'video');
+                      log('[broadway] IDR recovery: resubscribed → expect SPS+PPS+IDR');
+                    } catch(e) {
+                      log('[broadway] IDR recovery resubscribe failed: ' + e.message);
+                    }
+                  })();
+                }
+              }
+              // Schedule IDR check: 2s after transform install, retry every 8s
+              setTimeout(function checkIDR() {
+                if (bwFirstFrame) return;
+                if (bwPacketCount > 30) requestIDR();
+                else log('[broadway] IDR check: no packets yet (' + bwPacketCount + ')');
+                setTimeout(checkIDR, 8000);
+              }, 2000);
             } else {
               log('[broadway] WARN: audio receiver=' + (!!_audRecv) +
                 ' RTCRtpScriptTransform=' + (typeof RTCRtpScriptTransform !== 'undefined'));
