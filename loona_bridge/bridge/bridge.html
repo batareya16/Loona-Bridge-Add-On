@@ -53,11 +53,11 @@
       const _fmtpLogged = {};  // log each PT's full fmtp once per session
       function injectSpsParam(sdpStr, role) {
         const isAnswer = (role === 'answer');
-        // 'local' role: profile downgrade only, NO sps-pps-idr-in-keyframe injection.
-        // Used by wrapSetDesc so Firefox's H264 depacketizer works without that
-        // constraint (which causes framesReceived=0 / jitterBufferEmittedCount=0).
-        // Robot still gets sps-pps-idr-in-keyframe via createAnswer signaling.
+        // 'local' role: profile downgrade + packetization-mode=1 only; no sps-pps injection.
+        // wrapSetDesc strips sps-pps-idr-in-keyframe before passing local SDP to Firefox,
+        // but keeps packetization-mode=1 so depacketizer is correctly set to FU-A mode.
         const doProfileDown = (role === 'answer' || role === 'local');
+        const doPM1        = (role === 'answer' || role === 'local');
         return sdpStr.replace(
           /^(a=fmtp:(\d+) [^\r\n]*profile-level-id=([0-9a-fA-F]{6})[^\r\n]*)$/mg,
           (line, _, pt, plid) => {
@@ -67,21 +67,32 @@
                           profileIdc === 0x64 ? 'High' :
                           profileIdc >= 0x64  ? 'HP+' : 'p0x' + plid.slice(0,2);
             let result = line;
-            // Log full fmtp params once per PT so we can see packetization-mode etc.
+            // Log full fmtp params once per PT.
             if (isAnswer && !_fmtpLogged[pt]) {
               _fmtpLogged[pt] = true;
               const fmtpParams = line.replace(/^a=fmtp:\d+ /, '');
               console.log('[sdp-fmtp] answer PT=' + pt + ' ' + fmtpParams);
             }
-            // Downgrade High Profile → Constrained Baseline for answer and local SDP.
+            // Downgrade High Profile → Constrained Baseline.
             if (doProfileDown && profileIdc >= 0x64) {
               result = result.replace(plid, '42e01f');
               console.log('[sdp-patch] PT=' + pt + ' ' + pname + '(' + plid + ') → CBP(42e01f) [role=' + role + ']');
             }
-            // Inject sps-pps-idr-in-keyframe=1 into H264 ANSWER fmtp ONLY.
-            // REQUIRED in answer: without this Agora edge mutes video track entirely.
-            // NOT injected for 'local' role: Firefox's H264 depacketizer malfunctions
-            // when this param is present in setLocalDescription SDP → framesReceived=0.
+            // Force packetization-mode=1 (FU-A) on ALL H264 PTs in answer/local SDP.
+            // Root cause of framesReceived=0: Agora edge forwards the robot's stream
+            // using PT=97, whose SDP fmtp declares packetization-mode=0 (single-NAL).
+            // The actual RTP payload uses FU-A fragmentation (mode=1).
+            // Firefox initialises the depacketizer per fmtp → mode=0 → can't parse FU-A
+            // → jitterBufferEmittedCount=0 forever.
+            // Adding packetization-mode=1 here tells Firefox to use the FU-A depacketizer.
+            if (doPM1 && !result.includes('packetization-mode=1')) {
+              result += ';packetization-mode=1';
+              console.log('[sdp-patch] PT=' + pt + ' +packetization-mode=1 (forced FU-A) [role=' + role + ']');
+            }
+            // Inject sps-pps-idr-in-keyframe=1 into ANSWER fmtp only (not local).
+            // Required for Agora signaling: robot/edge won't send video without it.
+            // wrapSetDesc strips it from setLocalDescription so Firefox depacketizer
+            // doesn't change behaviour on this hint.
             if (isAnswer && !result.includes('sps-pps-idr-in-keyframe')) {
               result += ';sps-pps-idr-in-keyframe=1';
               console.log('[sdp-patch] PT=' + pt + ' +sps-pps-idr-in-keyframe (answer only)');
@@ -89,50 +100,6 @@
             return result;
           }
         );
-      }
-
-      // Remove H264 PTs without packetization-mode=1 from answer SDP.
-      // When both PT=126 (packetization-mode=1 / FU-A) and PT=97 (packetization-mode=0 /
-      // single-NAL) are present, Firefox 128 may initialise the H264 depacketizer with
-      // the wrong fmtp params → jitterBufferEmittedCount=0, framesReceived=0 forever.
-      // Removing mode-0 PT forces Firefox to only see FU-A PT=126.
-      function stripDuplicateH264Pts(sdp) {
-        const hasCRLF = sdp.indexOf('\r\n') >= 0;
-        const sep = hasCRLF ? '\r\n' : '\n';
-        const lines = sdp.split(sep);
-        // Collect H264 PTs without packetization-mode=1 (i.e. mode=0 / single-NAL)
-        const h264NoPMPts = new Set();
-        lines.forEach(l => {
-          const m = l.match(/^a=fmtp:(\d+) (.+)/);
-          if (!m) return;
-          const [, pt, params] = m;
-          if (/profile-level-id=/i.test(params) && !/packetization-mode=1/.test(params)) {
-            h264NoPMPts.add(pt);
-          }
-        });
-        if (h264NoPMPts.size === 0) return sdp;
-        // Collect RTX PTs that reference the no-PM1 H264 PTs (apt=<pt>)
-        const removePts = new Set(h264NoPMPts);
-        lines.forEach(l => {
-          const m = l.match(/^a=fmtp:(\d+) apt=(\d+)/);
-          if (m && removePts.has(m[2])) removePts.add(m[1]);
-        });
-        console.log('[sdp-simplify] removing H264 no-PM1 PTs from answer: ' + [...removePts].join(','));
-        const newLines = [];
-        for (const l of lines) {
-          // Drop a=fmtp/rtpmap/rtcp-fb for removed PTs
-          const aMatch = l.match(/^a=(?:fmtp|rtpmap|rtcp-fb):(\d+)/);
-          if (aMatch && removePts.has(aMatch[1])) continue;
-          // Strip removed PTs from m=video PT list
-          if (/^m=video/.test(l)) {
-            const parts = l.split(' ');
-            // parts[0]='m=video', parts[1]=port, parts[2]=proto, parts[3+]=PTs
-            newLines.push(parts.filter((p, i) => i < 3 || !removePts.has(p)).join(' '));
-            continue;
-          }
-          newLines.push(l);
-        }
-        return newLines.join(sep);
       }
 
       // Patch createAnswer() — ensures SDP is modified BEFORE setLocalDescription
@@ -150,10 +117,7 @@
           // Reset per-PT log guard so every renegotiation logs fmtp details.
           Object.keys(_fmtpLogged).forEach(k => delete _fmtpLogged[k]);
 
-          // 1) Inject sps-pps-idr-in-keyframe + profile downgrade into answer
-          const patched1 = injectSpsParam(answer.sdp, 'answer');
-          // 2) Remove duplicate H264 PTs (packetization-mode=0) from answer
-          const patched = stripDuplicateH264Pts(patched1);
+          const patched = injectSpsParam(answer.sdp, 'answer');
           if (patched !== answer.sdp) {
             console.log('[sdp-patch] createAnswer: patched H.264 fmtp in answer SDP');
             return new RTCSessionDescription({ type: answer.type, sdp: patched });
