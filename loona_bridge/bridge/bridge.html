@@ -141,6 +141,12 @@
           const pc = this;
           if (init && init.sdp) {
             const hasH264 = /H264|h264/i.test(init.sdp);
+            // Log what Agora actually passes — may differ from our createAnswer output
+            // if Agora SDK rewrites the SDP between createAnswer and setLocalDescription.
+            if (hasH264) {
+              (init.sdp.match(/a=fmtp:\d+[^\r\n]+/g) || [])
+                .forEach(l => console.log('[sdp-pre-patch] ' + l));
+            }
             // Strip sps-pps-idr-in-keyframe — Firefox must not see this in local SDP.
             const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
             const strippedIt = (stripped !== init.sdp);
@@ -153,7 +159,7 @@
             const p = (patched !== init.sdp)
               ? orig.call(this, { type: init.type, sdp: patched })
               : orig.apply(this, arguments);
-            // Log exactly what Firefox set as localDescription (confirm sps-pps gone).
+            // Log local SDP + video receiver codec params after resolution.
             if (p && typeof p.then === 'function') {
               p.then(() => {
                 try {
@@ -165,8 +171,21 @@
                       .forEach(l => console.log('[sdp-local-final] ' + l));
                     const hasSps = /sps-pps-idr-in-keyframe/.test(ld.sdp);
                     console.log('[sdp-local-final] sps-pps-idr-in-keyframe present=' + hasSps);
+                    // Log what codec PT Firefox actually configured for video receiver.
+                    // Empty codecs list = Firefox has NO codec for this receiver → root cause.
+                    pc.getReceivers()
+                      .filter(r => r.track && r.track.kind === 'video')
+                      .forEach(r => {
+                        const codecs = (r.getParameters().codecs || []);
+                        if (codecs.length === 0) {
+                          console.log('[recv-params] video receiver: NO codecs configured!');
+                        } else {
+                          codecs.forEach(c => console.log('[recv-params] video pt=' + c.payloadType +
+                            ' mime=' + c.mimeType + (c.sdpFmtpLine ? ' fmtp=' + c.sdpFmtpLine : '')));
+                        }
+                      });
                   }
-                } catch(e) {}
+                } catch(e) { console.log('[recv-params] error: ' + e.message); }
               }).catch(() => {});
             }
             return p;
@@ -185,13 +204,17 @@
         if (init && init.sdp) {
           const mvLine = init.sdp.match(/m=video[^\r\n]+/);
           const fmtpLines = init.sdp.match(/a=fmtp:\d+[^\r\n]+/g) || [];
-          if (mvLine) console.log('[sdp-offer] ' + mvLine[0]);
+          if (mvLine) {
+            console.log('[sdp-offer] ' + mvLine[0]);
+            // Log rtpmap lines (shows PT→codec mapping the robot uses)
+            (init.sdp.match(/a=rtpmap:\d+[^\r\n]+/g) || [])
+              .forEach(l => console.log('[sdp-offer] ' + l));
+          }
           fmtpLines.forEach(l => console.log('[sdp-offer] ' + l));
           // Strip sps-pps-idr-in-keyframe from robot's offer (robust regex).
           const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
           if (stripped !== init.sdp)
             console.log('[sdp-offer] stripped sps-pps-idr-in-keyframe from remote offer');
-          // Profile downgrade for remote SDP not needed (robot already uses CBP).
           if (stripped !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: stripped });
         }
         return origSetRemoteDesc.apply(this, arguments);
@@ -578,14 +601,18 @@
               report.forEach((r) => { if (r.type === 'codec') codecMap[r.id] = r; });
 
               const videoRx = [];
+              const allRx = [];
               report.forEach((r) => {
-                if (r.type === 'inbound-rtp' && r.kind === 'video') {
-                  videoRx.push(r);
-                  raw = {bytes: r.bytesReceived, framesRx: r.framesReceived,
-                         framesDec: r.framesDecoded, kf: r.keyFramesDecoded,
-                         impl: r.decoderImplementation,
-                         pkt: r.packetsReceived,
-                         jbe: r.jitterBufferEmittedCount};
+                if (r.type === 'inbound-rtp') {
+                  allRx.push(r);
+                  if (r.kind === 'video') {
+                    videoRx.push(r);
+                    raw = {bytes: r.bytesReceived, framesRx: r.framesReceived,
+                           framesDec: r.framesDecoded, kf: r.keyFramesDecoded,
+                           impl: r.decoderImplementation,
+                           pkt: r.packetsReceived,
+                           jbe: r.jitterBufferEmittedCount};
+                  }
                 }
               });
 
@@ -616,6 +643,14 @@
                   if (strVals) log('[stats-dbg#' + i + '-str] ' + strVals);
                 });
                 if (videoRx.length === 0) log('[stats-dbg] no inbound-rtp video entries in getStats()');
+                // Log non-video inbound-rtp entries (may reveal video on unexpected kind)
+                allRx.filter(r => r.kind !== 'video').forEach(r => {
+                  const codec = r.codecId && codecMap[r.codecId];
+                  log('[stats-other-rx] ssrc=' + r.ssrc + ' kind=' + r.kind +
+                    ' codecId=' + (r.codecId || 'NONE') +
+                    (codec ? ' → ' + codec.mimeType + '/pt=' + codec.payloadType : '') +
+                    ' pkt=' + r.packetsReceived + ' bytes=' + r.bytesReceived);
+                });
               }
 
               // Log all video streams (there may be >1 SSRC)
