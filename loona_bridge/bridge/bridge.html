@@ -17,12 +17,19 @@
       document.write('<script src="/sdk/rtm.js"><\/script>');
     }
   </script>
-  <!-- broadway.js: Emscripten H264 decoder (Decoder class → window.Decoder).
-       Loads avc.wasm from the same HTTP origin (served by bridge.js static server).
-       Used to decode H264 video that Agora edge sends on PT=0 — Firefox routes
-       PT=0 packets to the audio receiver (static PCMU type per RFC 3551), so
-       we intercept the audio receiver via RTCRtpScriptTransform and decode manually. -->
-  <script src="/broadway.js"></script>
+  <!-- broadway.js injected by bridge.js (Playwright addScriptTag) AFTER
+       window.Module.wasmBinary is pre-loaded from Node.js to avoid the async
+       fetch('avc.wasm') race with httpServer.close().
+       When running in manual/browser mode the script is loaded from /broadway.js. -->
+  <script>
+    if (typeof window !== 'undefined' && location.protocol !== 'about:') {
+      // Manual mode only: load broadway.js from HTTP server
+      // In Playwright mode bridge.js injects it after setting Module.wasmBinary
+      if (location.hash && location.hash.startsWith('#cfg=')) {
+        document.write('<script src="/broadway.js"><\/script>');
+      }
+    }
+  </script>
   <script>
     // ── SDP patch: inject sps-pps-idr-in-keyframe ─────────────────────────
     // Loona robot advertises {profile-level-id:42001f; sps-pps-idr-in-keyframe:1}

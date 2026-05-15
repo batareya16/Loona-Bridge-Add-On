@@ -416,6 +416,29 @@ function findSdkFile(pkgName, candidates) {
   });
 
   // Inject the SDK bundles directly.
+  // FIRST: pre-load avc.wasm and inject broadway.js with Module.wasmBinary already set.
+  // broadway.js (Emscripten H264 decoder) does fetch('avc.wasm') asynchronously after
+  // the page load event.  By the time that fetch runs, httpServer is already closed
+  // (we close it right after page.goto waitUntil:load).  To avoid the NetworkError,
+  // we read avc.wasm in Node.js, base64-encode it, and inject it as window.Module.wasmBinary
+  // BEFORE broadway.js runs — Emscripten checks Module.wasmBinary first and skips fetch.
+  const broadwayPath = path.join(__dirname, 'broadway.js');
+  const wasmPath     = path.join(__dirname, 'avc.wasm');
+  if (fs.existsSync(broadwayPath) && fs.existsSync(wasmPath)) {
+    const wasmB64 = fs.readFileSync(wasmPath).toString('base64');
+    await page.addScriptTag({
+      content: `window.Module = window.Module || {};
+window.Module.wasmBinary = Uint8Array.from(atob("${wasmB64}"), function(c){ return c.charCodeAt(0); });
+console.log('[bridge-init] avc.wasm pre-loaded (' + window.Module.wasmBinary.length + ' bytes)');`
+    });
+    await page.addScriptTag({ path: broadwayPath });
+    console.error('[bridge] broadway.js + avc.wasm injected (' + wasmB64.length + ' base64 chars)');
+  } else {
+    console.error('[bridge] WARNING: broadway.js or avc.wasm not found — H264 Broadway decoder disabled');
+    console.error('[bridge]   broadway.js: ' + broadwayPath + ' exists=' + fs.existsSync(broadwayPath));
+    console.error('[bridge]   avc.wasm:    ' + wasmPath + ' exists=' + fs.existsSync(wasmPath));
+  }
+
   await page.addScriptTag({ path: rtcPath });
   await page.addScriptTag({ path: rtmPath });
 
