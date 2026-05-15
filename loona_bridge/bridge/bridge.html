@@ -108,30 +108,35 @@
       //
       // v0.1.56: PT=0 in video section → [recv-params] pt=0 mime=video/H264 ✓
       //   BUT PT=0 in BOTH audio (PCMU/8000) and video (H264/90000) m-sections →
-      //   Firefox flat-codec-table conflict → no codec entries in getStats() AND
-      //   SSRC=40000 routed to audio path → xform readable empty → no frames.
+      //   Firefox flat-codec-table conflict → no codec entries → packets DROPPED.
       //
-      // v0.1.57: stripped PT=0 from audio everywhere → edge got answer without
-      //   PCMU → stopped sending video → trk.muted=true, bytes=0 (regression).
+      // v0.1.57: stripped PT=0 from audio everywhere → edge answer sans PCMU →
+      //   stopped sending video → trk.muted=true, bytes=0 (regression).
       //
       // v0.1.58: patchAudio=true only in setLocalDescription → still trk.muted=true.
-      //   Root cause: Agora SDK reads pc.localDescription after it's set; detecting
-      //   PCMU gone causes session teardown regardless of what createAnswer returned.
+      //   Agora SDK reads pc.localDescription post-set; PCMU gone → teardown.
       //
-      // v0.1.59 PLAN (this version):
-      //   SSRC-BASED FIX: Firefox demux is SSRC-first, PT-second.
-      //   Remote offer likely declares a=ssrc:40000 in audio m-section (explains
-      //   why stats show ssrc=40000 kind=audio in v0.1.55/0.1.56 even when bytes
-      //   are flowing). OR: no ssrc lines → Firefox falls back to PT=0=PCMU static.
-      //   Either way: inject a=ssrc:40000 cname:loona-video into VIDEO section and
-      //   strip any a=ssrc:40000 from AUDIO section of remote offer.
-      //   This forces Firefox SSRC→m-section lookup to route SSRC=40000 to video.
-      //   → jitter buffer gets packets → frames emitted → xform readable fills ✓
+      // v0.1.59: SSRC=40000 was already in VIDEO section (confirmed by logs).
+      //   fixSsrc40000 is a no-op for that session. bytes=0 confirmed: SSRC routing
+      //   now correctly targets video path, but codec conflict drops all packets
+      //   (0.1.56 "bytes>0" was packets accepted by audio path → counted as audio).
       //
-      //   Audio answer (PCMU): keep PT=0 in ALL SDPs (patchAudio always false).
-      //   Agora edge still gets PCMU in answer → keeps sending video ✓
+      // v0.1.60 PLAN (this version):
+      //   SPLIT THE SIGNAL:
+      //   • setRemoteDescription: strip PT=0 from audio (patchAudio=true) + add to
+      //     video → Firefox remote offer has PT=0 ONLY in video → no conflict ✓
+      //     createAnswer generates local answer without PT=0 in audio (echo of offer).
+      //   • pc.localDescription JS getter override: re-adds PT=0=PCMU to the audio
+      //     section of the stored local SDP before returning it to JS callers.
+      //     Agora SDK reads pc.localDescription and sends to edge → edge sees PCMU
+      //     in audio → keeps sending video ✓
+      //     Firefox C++ internals use stored SDP directly (not JS getter) → codec
+      //     table sees PT=0 only in video → no conflict → codec resolves ✓
+      //   • fixSsrc40000: keeps SSRC=40000 in video section for SSRC-based demux ✓
       //
-      // patchAudio=false (only value used): add PT=0 to video only, do NOT touch audio.
+      // patchAudio: used in addPt0AsH264.
+      //   false = add PT=0 to video only (used in createAnswer, setLocalDescription).
+      //   true  = also evict PT=0 from audio (used in setRemoteDescription).
       function addPt0AsH264(sdp, patchAudio) {
         if (!/m=video/.test(sdp)) return sdp;  // no video section — skip
         const sep = sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
@@ -247,6 +252,73 @@
         }
         return out.join(sep);
       }
+
+      // ── PCMU re-injector for pc.localDescription (Agora signaling only) ────────
+      // Firefox stores local answer WITHOUT PT=0 in audio (stripped by patchAudio=true
+      // in setRemoteDescription → createAnswer echo → no PT=0 in audio answer).
+      // Agora SDK reads pc.localDescription to send the answer to the edge.
+      // The edge requires PT=0=PCMU in the audio answer or it stops sending video.
+      // This function adds PT=0=PCMU back ONLY for JS-level reads of localDescription;
+      // Firefox C++ never calls JS getters, so its internal codec table stays clean.
+      function reAddAudioPcmu(sdp) {
+        if (!/m=audio/.test(sdp)) return sdp;
+        const sep = sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
+        const lines = sdp.split(sep);
+        // Check if PT=0 is already in the audio m= payload list
+        for (const l of lines) {
+          if (/^m=audio/.test(l)) {
+            const pts = l.split(' ').slice(3);
+            if (pts.includes('0')) return sdp; // already present — nothing to do
+            break;
+          }
+        }
+        const out = [];
+        let inserted = false;
+        for (let i = 0; i < lines.length; i++) {
+          const l = lines[i];
+          if (!inserted && /^m=audio/.test(l)) {
+            // Add PT=0 as first payload type in m=audio
+            const p = l.split(' ');
+            p.splice(3, 0, '0');
+            out.push(p.join(' '));
+            // Insert a=rtpmap immediately after m=audio line
+            out.push('a=rtpmap:0 PCMU/8000');
+            inserted = true;
+            console.log('[sdp-local-getter] PCMU/PT=0 re-added to audio for Agora→edge');
+            continue;
+          }
+          out.push(l);
+        }
+        return out.join(sep);
+      }
+
+      // Override pc.localDescription JS getter.
+      // JavaScript callers (Agora SDK) see the PCMU-restored version.
+      // Firefox C++ (codec table, ICE, DTLS) reads internal slots directly —
+      // JS getter override has zero effect on Firefox-internal operations.
+      (function patchLocalDescGetter() {
+        const proto = RTCPeerConnection.prototype;
+        const desc  = Object.getOwnPropertyDescriptor(proto, 'localDescription');
+        if (!desc || !desc.get) {
+          console.log('[sdp-patch] localDescription getter not found — skipping');
+          return;
+        }
+        Object.defineProperty(proto, 'localDescription', {
+          get() {
+            const ld = desc.get.call(this);
+            if (!ld || !ld.sdp) return ld;
+            // Only bother patching if this PC has H264 (video PC)
+            if (!/H264|h264/i.test(ld.sdp)) return ld;
+            const patched = reAddAudioPcmu(ld.sdp);
+            if (patched === ld.sdp) return ld;
+            // Return plain object — Agora only reads .type and .sdp
+            return { type: ld.type, sdp: patched };
+          },
+          configurable: true,
+          enumerable:   true
+        });
+        console.log('[sdp-patch] localDescription getter patched (PCMU restore for Agora)');
+      })();
 
       // Patch createAnswer() — ensures SDP is modified BEFORE setLocalDescription
       // sees it, regardless of whether setLocalDescription is called with or without args.
@@ -375,10 +447,11 @@
           const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
           if (stripped !== init.sdp)
             console.log('[sdp-offer] stripped sps-pps-idr-in-keyframe from remote offer');
-          // Add PT=0 as H264 alias to video section (patchAudio=false: keep PCMU in audio).
-          const withPt0 = addPt0AsH264(stripped, false);
-          // Fix SSRC demux: move a=ssrc:40000 from audio → video section so Firefox
-          // routes SSRC=40000 packets to video receiver instead of audio.
+          // Strip PT=0 from audio (patchAudio=true) AND add PT=0=H264 to video.
+          // Remote offer has PT=0 ONLY in video section → no flat-codec-table conflict.
+          // pc.localDescription getter (see above) re-adds PCMU for Agora→edge signaling.
+          const withPt0 = addPt0AsH264(stripped, true);
+          // Fix SSRC demux: ensure a=ssrc:40000 is in video section.
           const withSsrc = fixSsrc40000(withPt0);
           if (withSsrc !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: withSsrc });
         }
