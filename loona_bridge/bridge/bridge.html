@@ -106,36 +106,39 @@
       // ROOT CAUSE (v0.1.55): Agora edge sends H264 video RTP with PT=0
       // (RFC 3551 static PCMU assignment) instead of negotiated PT=97/126.
       // Firefox demultiplexes by SSRC → m-section → PT lookup within section.
-      // PT=0 has no entry in the video m-section → codecId=NONE → depacketizer
-      // never starts → jitterBufferEmittedCount=0 → framesReceived=0 forever.
+      // PT=0 has no entry in video m-section → codecId=NONE → depacketizer never
+      // starts → jitterBufferEmittedCount=0 → framesReceived=0 forever.
       //
-      // v0.1.56 FIRST ATTEMPT: added PT=0 to video section → Firefox reported
-      // [recv-params] video pt=0 mime=video/H264 at the API level, BUT
-      // [stats-codec] returned "no codec entries" — PT=0 now appeared in BOTH
-      // audio (PCMU/8000) and video (H264/90000) m-sections → Firefox conflict →
-      // demultiplexer registered neither codec → still codecId=NONE → still 0 frames.
+      // v0.1.56: added PT=0 to video section in all SDPs → Firefox API showed
+      // [recv-params] video pt=0 mime=video/H264, BUT getStats() returned
+      // "no codec entries" — PT=0 in both audio (PCMU/8000) and video (H264/90000)
+      // m-sections → Firefox flat-codec-table conflict → neither registered.
       //
-      // FIX (v0.1.57): ALSO strip PT=0 from the audio m-section to eliminate
-      // the conflict. After this: PT=0 exists only in video→H264/90000.
-      // Firefox can register a single unambiguous codec entry for PT=0 → H264,
-      // SSRC=40000 packets (currently counted as PCMU audio) route to H264
-      // depacketizer, jitter buffer emits, framesReceived > 0.
-      // (Audio subscription is explicitly skipped anyway — no user impact.)
-      function addPt0AsH264(sdp) {
+      // v0.1.57: also stripped PT=0 from audio → edge got answer without PCMU →
+      // Agora edge stopped sending video → trk.muted=true, bytes=0 (regression).
+      //
+      // v0.1.58 PLAN (this version):
+      //   createAnswer / setRemoteDescription:
+      //     • add PT=0 to VIDEO section only; keep audio untouched (patchAudio=false)
+      //     • edge gets answer WITH PCMU in audio → keeps sending video ✓
+      //   setLocalDescription:
+      //     • add PT=0 to VIDEO section AND evict PT=0 from audio (patchAudio=true)
+      //     • Firefox local state: PT=0 only in video → no codec-table conflict ✓
+      //   Result: negotiated audio codec set excludes PT=0 (local answer has no PCMU)
+      //   → getStats() has unambiguous video/H264 for PT=0 → codecId resolved ✓
+      //
+      // patchAudio=false (default): add PT=0 to video only, do NOT touch audio.
+      // patchAudio=true: ALSO evict PT=0 from audio section.
+      function addPt0AsH264(sdp, patchAudio) {
         if (!/m=video/.test(sdp)) return sdp;  // no video section — skip
         const sep = sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
         const lines = sdp.split(sep);
         const out = [];
         let inVid = false, inAud = false;
-        // Pass 1: copy lines with three mutations:
-        //   • audio m= line: remove PT=0 from payload list
-        //   • audio a= lines for PT=0: drop entirely (no PCMU codec conflict)
-        //   • video m= line: add PT=0 to payload list
-        //   • video a= lines for PT=0: drop (will re-add with correct H264 params)
         for (const l of lines) {
           if (/^m=/.test(l)) { inVid = /^m=video/.test(l); inAud = /^m=audio/.test(l); }
-          // Audio section — evict PT=0 (PCMU) entirely
-          if (inAud) {
+          // Audio section — evict PT=0 (PCMU) only when patchAudio=true
+          if (patchAudio && inAud) {
             if (/^a=(rtpmap|fmtp|rtcp-fb):0\b/.test(l)) {
               console.log('[sdp-pt0] dropped from audio: ' + l.slice(0, 60));
               continue;
@@ -148,9 +151,9 @@
               continue;
             }
           }
-          // Video section — drop existing PT=0 a= (will re-add correctly below)
+          // Video section — drop existing PT=0 a= (will re-add with H264 params)
           if (inVid && /^a=(rtpmap|fmtp|rtcp-fb):0\b/.test(l)) continue;
-          // Video m= line — add PT=0
+          // Video m= line — insert PT=0 into payload type list
           if (/^m=video/.test(l)) {
             const parts = l.split(' ');
             if (!parts.slice(3).includes('0')) {
@@ -162,17 +165,16 @@
             out.push(l);
           }
         }
-        // Pass 2: locate end of video section and splice in PT=0 rtpmap+fmtp
+        // Locate end of video section and splice in PT=0 rtpmap+fmtp
         let insertIdx = -1;
         inVid = false;
         for (let i = 0; i < out.length; i++) {
           if (/^m=/.test(out[i])) {
-            if (inVid) { insertIdx = i; inVid = false; }  // insert before next m=
+            if (inVid) { insertIdx = i; inVid = false; }
             if (/^m=video/.test(out[i])) inVid = true;
           }
         }
         if (inVid) {
-          // Video is the last section — insert before any trailing empty strings
           let last = out.length - 1;
           while (last >= 0 && out[last] === '') last--;
           insertIdx = last + 1;
@@ -202,7 +204,8 @@
           // Reset per-PT log guard so every renegotiation logs fmtp details.
           Object.keys(_fmtpLogged).forEach(k => delete _fmtpLogged[k]);
 
-          const withPt0  = addPt0AsH264(answer.sdp);
+          // patchAudio=false: keep PCMU in audio answer — Agora edge requires it
+          const withPt0  = addPt0AsH264(answer.sdp, false);
           const patched  = injectSpsParam(withPt0, 'answer');
           if (patched !== answer.sdp) {
             console.log('[sdp-patch] createAnswer: patched H.264 fmtp + PT=0 H264 alias in answer SDP');
@@ -236,9 +239,10 @@
             // Strip sps-pps-idr-in-keyframe — Firefox must not see this in local SDP.
             const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
             const strippedIt = (stripped !== init.sdp);
-            // Add PT=0 as H264 alias (safety net: ensures local SDP has PT=0→H264
-            // even if Agora SDK rewrites SDP between createAnswer and setLocalDesc).
-            const withPt0 = addPt0AsH264(stripped);
+            // Add PT=0 as H264 alias to video AND evict PT=0 from audio (patchAudio=true).
+            // Local SDP must have PT=0 ONLY in video so Firefox codec table is unambiguous.
+            // The answer already sent to the edge (via createAnswer) keeps PCMU in audio.
+            const withPt0 = addPt0AsH264(stripped, true);
             // Profile downgrade only ('local' role — no sps-pps re-injection).
             const patched = injectSpsParam(withPt0, 'local');
             console.log('[sdp-patch] ' + method + ': H264=' + hasH264 +
@@ -304,10 +308,11 @@
           const stripped = init.sdp.replace(/;?sps-pps-idr-in-keyframe=[^\s;]*/g, '');
           if (stripped !== init.sdp)
             console.log('[sdp-offer] stripped sps-pps-idr-in-keyframe from remote offer');
-          // Add PT=0 as H264 alias to remote SDP's video section.
-          // Agora edge sends H264 video packets with PT=0; Firefox needs PT=0
-          // listed in the video m-section to correctly depacketize those frames.
-          const withPt0 = addPt0AsH264(stripped);
+          // Add PT=0 as H264 alias to remote SDP's video section only.
+          // patchAudio=false: do NOT remove PCMU from remote audio — edge must
+          // see its own offer reflected back correctly (audio conflict resolved by
+          // setLocalDescription removing PCMU from the local answer instead).
+          const withPt0 = addPt0AsH264(stripped, false);
           if (withPt0 !== init.sdp) return origSetRemoteDesc.call(this, { type: init.type, sdp: withPt0 });
         }
         return origSetRemoteDesc.apply(this, arguments);
