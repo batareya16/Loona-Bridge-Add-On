@@ -386,29 +386,37 @@ function findSdkFile(pkgName, candidates) {
     }
   }
 
-  function buildFfArgs() {
-    const hw = useHwDec ? ['-c:v', 'hevc_v4l2m2m'] : [];
-    // Limit software decode to 2 threads: leaves 2 cores for Firefox + Node.js + TCP control.
-    // Hardware decode ignores -threads (VPU does the work); only applied for sw path.
-    const threads = useHwDec ? [] : ['-threads', '2'];
-    return [
-      '-loglevel', 'error',
-      '-fflags', '+nobuffer+discardcorrupt',
-      // NOTE: -flags +low_delay removed — it disables B-frame reordering which
-      // causes "Could not find ref with POC N" errors when robot sends B-frames.
-      '-analyzeduration', '0',
-      '-probesize', '32',
-      '-f', 'hevc',
-      ...hw,
-      '-i', 'pipe:0',
-      ...threads,
-      '-f', 'image2pipe',
-      '-vcodec', 'mjpeg',
-      '-q:v', '4',
-      '-an',
-      'pipe:1',
-    ];
+  // ── GStreamer pipeline builder ─────────────────────────────────────────────────
+  // Hardware (ARM64 + rpivid): v4l2h265dec uses the V4L2 *stateful* decoder API
+  //   exposed by /dev/video19 (rpi-hevc-dec).  ffmpeg's hevc_v4l2m2m needs the
+  //   *stateless* M2M API — incompatible.  GStreamer's v4l2h265dec is correct.
+  // Software fallback: avdec_h265 (GStreamer-libav), limited to 2 threads so
+  //   2 cores stay free for Firefox + Node.js + TCP control.
+  function buildDecoderArgs() {
+    if (useHwDec) {
+      return [
+        '-q',                           // suppress pipeline state messages
+        'fdsrc', 'fd=0', 'is-live=true', 'blocksize=131072',
+        '!', 'h265parse',
+        '!', 'v4l2h265dec', 'device=/dev/video19',
+        '!', 'videoconvert',
+        '!', 'jpegenc', 'quality=80',
+        '!', 'fdsink', 'fd=1', 'sync=false', 'async=false',
+      ];
+    } else {
+      return [
+        '-q',
+        'fdsrc', 'fd=0', 'is-live=true', 'blocksize=131072',
+        '!', 'h265parse',
+        '!', 'avdec_h265', 'max-threads=2',
+        '!', 'videoconvert',
+        '!', 'jpegenc', 'quality=80',
+        '!', 'fdsink', 'fd=1', 'sync=false', 'async=false',
+      ];
+    }
   }
+  // Keep old name as alias so nothing else breaks.
+  const buildFfArgs = buildDecoderArgs;
 
   function startFfmpeg() {
     if (ffH265) return;
@@ -416,27 +424,32 @@ function findSdkFile(pkgName, candidates) {
     const args = buildFfArgs();
     if (useHwDec) {
       probeHwDevice();  // log available /dev/videoN for diagnostics
-      console.error('[ffmpeg] trying hardware H265 decode (hevc_v4l2m2m)');
+      console.error('[gst] hardware H265 decode via v4l2h265dec (/dev/video19)');
+    } else {
+      console.error('[gst] software H265 decode via avdec_h265 (max-threads=2)');
     }
 
-    ffH265 = cp.spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'inherit'] });
+    ffH265 = cp.spawn('gst-launch-1.0', args, { stdio: ['pipe', 'pipe', 'inherit'] });
     resetNoOutputTimer();  // arm the watchdog immediately
 
     ffH265.stdin.on('error', () => {});
-    ffH265.on('error', (e) => console.error('[ffmpeg] spawn error: ' + e.message));
+    ffH265.on('error', (e) => {
+      console.error('[gst] spawn error: ' + e.message +
+                    (e.code === 'ENOENT' ? ' — is gstreamer1.0-tools installed?' : ''));
+    });
     ffH265.on('exit', (code, signal) => {
       clearTimeout(ffNoOutputTimer);
       if (signal) {
         // Killed by our own kill() call (no-output timer or stdin overrun).
-        // This is NOT a hw decoder failure — code is null when killed by signal.
-        console.error('[ffmpeg] killed (' + signal + ') — will restart on next IDR');
+        // NOT a hw decoder failure — don't disable useHwDec.
+        console.error('[gst] killed (' + signal + ') — will restart on next IDR');
       } else if (code !== 0 && useHwDec) {
-        // Non-zero exit with hw enabled = real decoder error (bad device, unsupported format…)
-        console.error('[ffmpeg] hw decode error (code=' + code +
-                      ') — switching to software decode');
+        // Non-zero exit with hw enabled = real decoder error.
+        console.error('[gst] hw decode error (code=' + code +
+                      ') — switching to software (avdec_h265)');
         useHwDec = false;
       } else {
-        console.error('[ffmpeg] exited code=' + code + ' — will restart on next IDR');
+        console.error('[gst] exited code=' + code + ' — will restart on next IDR');
       }
       ffH265 = null;
       ffBuf  = Buffer.alloc(0);
@@ -475,7 +488,7 @@ function findSdkFile(pkgName, candidates) {
         pyWs.send(latestJpeg, { binary: true });
         if (firstJpeg) {
           firstJpeg = false;
-          console.error('[ffmpeg] ✓ first JPEG sent to Python (' +
+          console.error('[gst] ✓ first JPEG sent to Python (' +
                         latestJpeg.length + ' B, hw=' + useHwDec + ')');
           // Notify bridge.html for its log/counters (no WS send needed there).
           page.evaluate(() => {
@@ -485,7 +498,7 @@ function findSdkFile(pkgName, candidates) {
       }
     });
 
-    console.error('[ffmpeg] H265 decoder started pid=' + ffH265.pid +
+    console.error('[gst] decoder started pid=' + ffH265.pid +
                   ' hw=' + useHwDec);
   }
 
