@@ -378,7 +378,7 @@ function findSdkFile(pkgName, candidates) {
       // If a specific device is needed: return '/dev/video11';
       const devFiles = fs.readdirSync('/dev').filter(f => /^video\d+$/.test(f));
       if (devFiles.length === 0) return null;
-      console.error('[ffmpeg] V4L2 devices available: ' + devFiles.map(f => '/dev/' + f).join(', '));
+      console.error('[gst] V4L2 devices available: ' + devFiles.map(f => '/dev/' + f).join(', '));
       // Return undefined — ffmpeg will auto-select from what the container can see.
       return null;  // null = no explicit -device flag; ffmpeg auto-scans
     } catch (_) {
@@ -513,8 +513,12 @@ function findSdkFile(pkgName, candidates) {
       startFfmpeg();
     }
     if (ffH265 && !ffH265.stdin.destroyed) {
-      if (ffH265.stdin.writableLength > FF_STDIN_MAX) {
-        console.error('[ffmpeg] stdin overrun — killing to reset latency (will restart on next IDR)');
+      // Skip overrun check during GStreamer pipeline startup (NULL→PLAYING can take 1-3 s).
+      // fdsrc only starts reading once PLAYING is reached — before that the write buffer
+      // accumulates.  After the first JPEG is produced, the pipeline is fully running and
+      // the 32 KB limit applies normally.
+      if (ffFirstFrameSeen && ffH265.stdin.writableLength > FF_STDIN_MAX) {
+        console.error('[gst] stdin overrun — killing to reset latency (will restart on next IDR)');
         ffH265.kill();
         return;
       }
