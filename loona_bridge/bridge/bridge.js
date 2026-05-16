@@ -340,21 +340,28 @@ function findSdkFile(pkgName, candidates) {
   openPyWs();
 
   // ── ffmpeg H265 decoder ────────────────────────────────────────────────────────
-  let ffH265          = null;
-  let ffBuf           = Buffer.alloc(0);
-  // hevc_v4l2m2m requires rpivid kernel driver — absent on HA OS.
-  // Try once on ARM64 in case someone runs on Pi OS; fall back to software on failure.
-  let useHwDec        = (process.arch === 'arm64');
-  let ffNoOutputTimer = null;  // kills ffmpeg if no JPEG output for 2 s
+  let ffH265            = null;
+  let ffBuf             = Buffer.alloc(0);
+  // hevc_v4l2m2m: rpivid driver present in HA OS on RPi4 (/dev/video19).
+  // Try hw first on ARM64; fall back to software only on non-zero exit code (real error).
+  // Signal-kills (code=null, from our own kill()) are NOT hw failures — don't disable hw.
+  let useHwDec          = (process.arch === 'arm64');
+  let ffNoOutputTimer   = null;
+  let ffFirstFrameSeen  = false;  // true after first JPEG output from current ffmpeg instance
 
+  // First frame can take 3-5 s (V4L2M2M init or software codec startup).
+  // After the first frame, 2 s silence = decode error → kill + wait for IDR.
   function resetNoOutputTimer() {
     clearTimeout(ffNoOutputTimer);
+    const ms = ffFirstFrameSeen ? 2000 : 5000;
     ffNoOutputTimer = setTimeout(() => {
       if (ffH265) {
-        console.error('[ffmpeg] no JPEG output for 2 s — decode error, killing (will restart on next IDR)');
+        console.error('[ffmpeg] no JPEG output for ' + (ms / 1000) +
+                      's — ' + (ffFirstFrameSeen ? 'decode stall' : 'init timeout') +
+                      ', killing (will restart on next IDR)');
         ffH265.kill();
       }
-    }, 2000);
+    }, ms);
   }
 
   const FF_STDIN_MAX = 32 * 1024;   // 32 KB — kill+restart if stdin backs up
@@ -381,6 +388,9 @@ function findSdkFile(pkgName, candidates) {
 
   function buildFfArgs() {
     const hw = useHwDec ? ['-c:v', 'hevc_v4l2m2m'] : [];
+    // Limit software decode to 2 threads: leaves 2 cores for Firefox + Node.js + TCP control.
+    // Hardware decode ignores -threads (VPU does the work); only applied for sw path.
+    const threads = useHwDec ? [] : ['-threads', '2'];
     return [
       '-loglevel', 'error',
       '-fflags', '+nobuffer+discardcorrupt',
@@ -390,6 +400,7 @@ function findSdkFile(pkgName, candidates) {
       '-f', 'hevc',
       ...hw,
       '-i', 'pipe:0',
+      ...threads,
       '-f', 'image2pipe',
       '-vcodec', 'mjpeg',
       '-q:v', '4',
@@ -400,6 +411,7 @@ function findSdkFile(pkgName, candidates) {
 
   function startFfmpeg() {
     if (ffH265) return;
+    ffFirstFrameSeen = false;  // reset per-instance flag
     const args = buildFfArgs();
     if (useHwDec) {
       probeHwDevice();  // log available /dev/videoN for diagnostics
@@ -411,10 +423,15 @@ function findSdkFile(pkgName, candidates) {
 
     ffH265.stdin.on('error', () => {});
     ffH265.on('error', (e) => console.error('[ffmpeg] spawn error: ' + e.message));
-    ffH265.on('exit', (code) => {
+    ffH265.on('exit', (code, signal) => {
       clearTimeout(ffNoOutputTimer);
-      if (code !== 0 && useHwDec) {
-        console.error('[ffmpeg] hw decode failed (code=' + code +
+      if (signal) {
+        // Killed by our own kill() call (no-output timer or stdin overrun).
+        // This is NOT a hw decoder failure — code is null when killed by signal.
+        console.error('[ffmpeg] killed (' + signal + ') — will restart on next IDR');
+      } else if (code !== 0 && useHwDec) {
+        // Non-zero exit with hw enabled = real decoder error (bad device, unsupported format…)
+        console.error('[ffmpeg] hw decode error (code=' + code +
                       ') — switching to software decode');
         useHwDec = false;
       } else {
@@ -444,7 +461,8 @@ function findSdkFile(pkgName, candidates) {
       }
       if (!latestJpeg) return;
 
-      // Got a JPEG — reset the no-output watchdog.
+      // Got a JPEG — mark first frame seen and reset the no-output watchdog.
+      ffFirstFrameSeen = true;
       resetNoOutputTimer();
 
       // Rate-limit + send binary directly to Python — no page.evaluate needed.
