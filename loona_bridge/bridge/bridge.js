@@ -279,6 +279,14 @@ function findSdkFile(pkgName, candidates) {
       'media.ffmpeg.vaapi-drm-display.enabled':      false,
       // Ensure GMP decoder is active for WebRTC H.264.
       'media.gmp.decoder.enabled':                   true,
+      // ── H265/HEVC WebRTC support (Firefox 130+) ─────────────────────────
+      // Loona robot sends H265 (HEVC) video via Agora on SSRC=40000.
+      // Firefox 130 added H265 WebRTC support but it is OFF by default.
+      // Enabling it allows Agora to negotiate H265 in the video SDP so the
+      // robot routes H265 to the video receiver (not PT=0 audio PCMU slot).
+      // GStreamer avdec_h265 (installed by playwright --with-deps via
+      // gstreamer1.0-libav) provides software H265 decode — no hardware GPU needed.
+      'media.peerconnection.video.h265_enabled': true,
       // Disable background services that slow startup.
       'app.update.enabled':                  false,
       'toolkit.telemetry.enabled':           false,

@@ -477,55 +477,53 @@
         log('Agora credentials received: channel=' + cfg.channel.slice(0,16));
       }
 
-      // 2a) Wait for H.264 WebRTC codec — NO TIMEOUT, NO FALLBACK.
-      // Starting Agora without H.264 is pointless: the SDP will contain only
-      // audio codecs, framesRx stays 0 forever.  We block here indefinitely until
-      // RTCPeerConnection.createOffer() returns an SDP with H264.
-      //
-      // Normal case (prewarm succeeded): returns on the very first poll (~0 s).
-      // Fallback case (GMP downloading at runtime): polls every 2 s until ready.
-      // If OpenH264 never becomes available (GMP broken), the bridge stays here
-      // forever — which is correct: no video is better than a running Agora client
-      // that silently delivers nothing.
-      await (async function waitForH264Codec() {
+      // 2a) Wait for H.265 or H.264 WebRTC codec — NO TIMEOUT, NO FALLBACK.
+      // Primary codec is H265 (Loona robot sends HEVC). Firefox 130 with
+      // media.peerconnection.video.h265_enabled=true includes H265 in createOffer().
+      // H264 via OpenH264 GMP is accepted as fallback.
+      // Polls until at least one video codec appears in the SDP offer.
+      await (async function waitForVideoCodec() {
         const POLL_MS = 2000;
         let attempt = 0;
         while (true) {
-          let hasH264 = false;
+          let hasH265 = false, hasH264 = false;
           try {
             const pc = new RTCPeerConnection();
             pc.addTransceiver('video', { direction: 'recvonly' });
             const offer = await pc.createOffer();
+            hasH265 = /H265|HEVC|hevc/i.test(offer.sdp);
             hasH264 = /H264|h264/i.test(offer.sdp);
             pc.close();
           } catch (e) {
-            log('[h264-wait] createOffer error: ' + e.message);
+            log('[codec-wait] createOffer error: ' + e.message);
           }
-          if (hasH264) {
-            log('[h264-wait] ✓ H.264 ready' + (attempt ? ' (waited ' + Math.round(attempt*POLL_MS/1000) + 's)' : ''));
+          if (hasH265 || hasH264) {
+            const label = hasH265 ? 'H265' + (hasH264 ? '+H264' : '') : 'H264 only';
+            log('[codec-wait] ✓ ' + label + ' ready' + (attempt ? ' (waited ' + Math.round(attempt*POLL_MS/1000) + 's)' : ''));
             return;
           }
           attempt++;
-          // Log only every 15 attempts (~30 s) to avoid spam
           if (attempt === 1 || attempt % 15 === 0)
-            log('[h264-wait] waiting for GMP... ' + Math.round(attempt*POLL_MS/1000) + 's');
+            log('[codec-wait] no H265/H264 in SDP yet... ' + Math.round(attempt*POLL_MS/1000) + 's');
           await new Promise(r => setTimeout(r, POLL_MS));
         }
       })();
 
-      // 2b-pre) Probe actual H.264 decode capability via mediaCapabilities API.
-      // This is a REAL decode test (not just SDP negotiation) — if supported=false,
-      // the GMP is not functional even though H.264 appears in createOffer().
-      try {
-        const cap = await navigator.mediaCapabilities.decodingInfo({
-          type: 'media-source',
-          video: { contentType: 'video/mp4; codecs="avc1.42e01f"',
-                   width: 1280, height: 720, bitrate: 2000000, framerate: 15 }
-        });
-        log('[h264-caps] supported=' + cap.supported + ' smooth=' + cap.smooth +
-            ' powerEff=' + cap.powerEfficient);
-      } catch (e) {
-        log('[h264-caps] mediaCapabilities error: ' + e.message);
+      // 2b-pre) Probe H265 and H264 decode capability via mediaCapabilities API.
+      for (const [label, contentType] of [
+        ['H265', 'video/mp4; codecs="hev1.1.6.L93.90"'],
+        ['H264', 'video/mp4; codecs="avc1.42e01f"'],
+      ]) {
+        try {
+          const cap = await navigator.mediaCapabilities.decodingInfo({
+            type: 'media-source',
+            video: { contentType, width: 1280, height: 720, bitrate: 2000000, framerate: 15 }
+          });
+          log('[codec-caps] ' + label + ' supported=' + cap.supported + ' smooth=' + cap.smooth +
+              ' powerEff=' + cap.powerEfficient);
+        } catch (e) {
+          log('[codec-caps] ' + label + ' mediaCapabilities error: ' + e.message);
+        }
       }
 
       // 2c) Join the Agora RTC channel.
@@ -536,7 +534,11 @@
       // mode, so we go live+host too.
       const rtcMode  = cfg.rtc_mode || 'live';
       const rtcRole  = cfg.role     || 'host';
-      const rtcCodec = cfg.codec || 'h264';
+      // Default to 'h265': Loona robot sends H265 (HEVC) video via Agora.
+      // With codec='h265' and Firefox 130+ (media.peerconnection.video.h265_enabled=true),
+      // Agora negotiates H265 in the video SDP → robot routes H265 to video receiver →
+      // Firefox decodes natively via GStreamer avdec_h265 → canvas capture via tick().
+      const rtcCodec = cfg.codec || 'h265';
       const rtcClient = AgoraRTC.createClient({mode: rtcMode, codec: rtcCodec, role: rtcRole});
       log('[rtc-codec] using codec=' + rtcCodec + ' mode=' + rtcMode + ' role=' + rtcRole);
 

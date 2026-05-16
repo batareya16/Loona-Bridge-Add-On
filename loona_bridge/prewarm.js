@@ -83,6 +83,8 @@ async function phase1() {
         'media.autoplay.default':                     0,
         'media.navigator.permission.disabled':        true,
         'media.navigator.streams.fake':               false,
+        // Enable H265 WebRTC (Firefox 130+) so createOffer() includes H265 PT.
+        'media.peerconnection.video.h265_enabled':    true,
         'app.update.enabled':                         false,
         'toolkit.telemetry.enabled':                  false,
         'datareporting.healthreport.service.enabled': false,
@@ -113,18 +115,22 @@ async function phase1() {
   while (Date.now() - start < TIMEOUT_MS) {
     const elapsed = Math.round((Date.now() - start) / 1000);
 
-    const hasH264 = await page.evaluate(async () => {
+    const { hasH264, hasH265 } = await page.evaluate(async () => {
       try {
         const pc = new RTCPeerConnection();
         pc.addTransceiver('video', { direction: 'recvonly' });
         const offer = await pc.createOffer();
         pc.close();
-        return /H264|h264/i.test(offer.sdp);
-      } catch (_) { return false; }
-    }).catch(() => false);
+        return {
+          hasH264: /H264|h264/i.test(offer.sdp),
+          hasH265: /H265|HEVC|hevc/i.test(offer.sdp),
+        };
+      } catch (_) { return { hasH264: false, hasH265: false }; }
+    }).catch(() => ({ hasH264: false, hasH265: false }));
 
+    if (hasH265) log('  H265 in SDP: YES ✓' + (hasH264 ? ' (H264 also present)' : ''));
     if (hasH264) {
-      log('✓ OpenH264 GMP ready after ' + elapsed + 's (Firefox registered it automatically)');
+      log('✓ OpenH264 GMP ready after ' + elapsed + 's');
       found = true;
       break;
     }
