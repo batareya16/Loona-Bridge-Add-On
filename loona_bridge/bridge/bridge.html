@@ -560,6 +560,283 @@
       // Guard: Broadway pipeline is set up only once per video session.
       let broadwayActive = false;
 
+      // ── Shared canvas/frame state (audio path + video path) ──────────────────
+      // Hoisted here so both user-published handlers (audio and video) can access them.
+      const FPS         = cfg.fps || 15;
+      const QUALITY     = cfg.jpeg_quality || 0.7;
+      const minInterval = 1000 / FPS;
+      const grabCanvas  = document.getElementById('grab');
+      const grabCtx     = grabCanvas.getContext('2d');
+      let capturedFrames = 0, firstFrameLogged = false, lastSendTs = 0;
+
+      // ── PC finder — hoisted so it works from both audio and video paths ───────
+      const isPC = (o) => o && typeof o === 'object' &&
+        typeof o.getStats === 'function' && typeof o.getReceivers === 'function';
+      function findPC(obj, d, wantVideo) {
+        if (d > 7 || !obj || typeof obj !== 'object') return null;
+        if (isPC(obj)) {
+          if (!wantVideo) return obj;
+          try {
+            const hasLiveVideo = obj.getReceivers().some(
+              r => r.track && r.track.kind === 'video' && r.track.readyState === 'live'
+            );
+            if (hasLiveVideo) return obj;
+          } catch (_) {}
+          return null;
+        }
+        try { for (const k of Object.keys(obj)) {
+          try { const v = obj[k];
+            if (v && typeof v === 'object' && !Array.isArray(v)) {
+              const r = findPC(v, d + 1, wantVideo); if (r) return r; }
+          } catch (_) {}
+        }} catch (_) {}
+        return null;
+      }
+      const findBestPC = (obj) => findPC(obj, 0, true) || findPC(obj, 0, false);
+
+      // ── Broadway H264 software decoder ──────────────────────────────────────
+      // Called from audio-published handler (primary: robot sends H264/PT=0 via
+      // PCMU slot; skipping audio subscribe keeps routing to audio receiver)
+      // and from video-published handler (fallback).
+      // broadwayActive guard (set by callers) prevents double-install per session.
+      function installBroadway() {
+        (function attemptInstall(retries) {
+          try {
+            // Check PC first — Agora may need a moment to set up receivers
+            const pc = findBestPC(rtcClient);
+            if (!pc) {
+              log('[broadway] no PC yet (attempt ' + (retries+1) + ')');
+              if (retries < 12) setTimeout(() => attemptInstall(retries + 1), 1000);
+              else log('[broadway] gave up waiting for PC');
+              return;
+            }
+            const receivers = pc.getReceivers();
+            if (receivers.length === 0) {
+              log('[broadway] 0 receivers (attempt ' + (retries+1) + ')');
+              if (retries < 12) setTimeout(() => attemptInstall(retries + 1), 1000);
+              else log('[broadway] gave up waiting for receivers');
+              return;
+            }
+
+            if (typeof Decoder === 'undefined') {
+              log('[broadway] Decoder not available — broadway.js not loaded');
+              return;
+            }
+
+            const bwDecoder = new Decoder({ rgb: true });
+            let bwHasIDR = false, idrRetries = 0, totalPktCount = 0;
+
+            bwDecoder.onDecoderReady = function() {
+              log('[broadway] ✓ WASM decoder ready');
+            };
+
+            bwDecoder.onPictureDecoded = function(buffer, width, height) {
+              if (grabCanvas.width  !== width)  grabCanvas.width  = width;
+              if (grabCanvas.height !== height) grabCanvas.height = height;
+              const imageData = grabCtx.createImageData(width, height);
+              imageData.data.set(buffer);
+              grabCtx.putImageData(imageData, 0, 0);
+              capturedFrames++;
+              if (!firstFrameLogged) {
+                firstFrameLogged = true;
+                log('[broadway] ✓ FIRST FRAME DECODED — ' + width + 'x' + height);
+              }
+              if (ws.readyState === 1) {
+                const now = Date.now();
+                if (now - lastSendTs >= minInterval) {
+                  lastSendTs = now;
+                  grabCanvas.toBlob((blob) => {
+                    if (!blob) return;
+                    blob.arrayBuffer().then((ab) => {
+                      if (ws.readyState === 1) ws.send(ab);
+                    });
+                  }, 'image/jpeg', QUALITY);
+                }
+              }
+            };
+
+            // Pre-feed SPS+PPS from sprop-parameter-sets (set by setRemoteDescription patch)
+            if (window._spropSPS) {
+              try {
+                const sps = Uint8Array.from(atob(window._spropSPS), c => c.charCodeAt(0));
+                bwDecoder.decode(sps);
+                log('[broadway] pre-fed SPS (' + sps.length + ' B)');
+              } catch (e) { log('[broadway] SPS pre-feed err: ' + e.message); }
+            }
+            if (window._spropPPS) {
+              try {
+                const pps = Uint8Array.from(atob(window._spropPPS), c => c.charCodeAt(0));
+                bwDecoder.decode(pps);
+                log('[broadway] pre-fed PPS (' + pps.length + ' B)');
+              } catch (e) { log('[broadway] PPS pre-feed err: ' + e.message); }
+            }
+            if (!window._spropSPS)
+              log('[broadway] no sprop-parameter-sets — waiting for in-band SPS/PPS');
+
+            // ── RTCRtpScriptTransform worker ─────────────────────────────────
+            // Pipes frames through readable→writable (avoids back-pressure stall)
+            // and posts each frame's encoded payload + metadata to main thread.
+            // chunk.data is the encoded payload AFTER RTP depacketization — for
+            // an audio receiver carrying PT=0/H264 this is the raw H264 payload
+            // (FU-A fragment, STAP-A, or single NAL unit).
+            const workerSrc = [
+              'self.onrtctransform = function(ev) {',
+              '  var tf = ev.transformer;',
+              '  tf.readable.pipeThrough(new TransformStream({',
+              '    transform: function(chunk, ctrl) {',
+              '      try {',
+              '        var m  = chunk.getMetadata ? chunk.getMetadata() : {};',
+              '        var raw = chunk.data;',
+              '        var u8 = new Uint8Array(raw instanceof ArrayBuffer ? raw.slice(0) : raw);',
+              '        var nt = u8.length > 0 ? (u8[0] & 0x1f) : -1;',
+              '        var ft = (nt===5 || (nt===28 && u8.length>1 && (u8[1]&0x80) && (u8[1]&0x1f)===5)) ? "IDR" : "P";',
+              '        self.postMessage({ data: u8, ts: chunk.timestamp||0, seq: m.sequenceNumber||0, ft: ft }, [u8.buffer]);',
+              '      } catch(_) {}',
+              '      ctrl.enqueue(chunk);',
+              '    }',
+              '  })).pipeTo(tf.writable).catch(function(){});',
+              '};'
+            ].join('\n');
+            const workerBlob = new Blob([workerSrc], { type: 'application/javascript' });
+            const workerUrl  = URL.createObjectURL(workerBlob);
+
+            log('[broadway] found PC, receivers=' + receivers.length);
+
+            // ── Per-receiver transform + FU-A reassembler ────────────────────
+            // Each receiver gets its own worker and independent reassembler state
+            // so fragments from audio and video receivers never get mixed.
+            receivers.forEach((recv, idx) => {
+              const kind = recv.track ? recv.track.kind : '?';
+              log('[broadway] recv#' + idx + ' kind=' + kind +
+                  (recv.track ? ' state=' + recv.track.readyState + ' muted=' + recv.track.muted : ''));
+
+              // Per-receiver state
+              let fuBuf = null, fuNalLocal = 0, recvPktCount = 0;
+
+              function processPayload(payload) {
+                recvPktCount++;
+                totalPktCount++;
+                const pktNum = totalPktCount;
+                if (!payload || payload.length < 1) return;
+                const naluType = payload[0] & 0x1f;
+
+                if (naluType === 28) {
+                  // FU-A fragmentation unit
+                  const fuHdr    = payload[1];
+                  const startBit = (fuHdr & 0x80) !== 0;
+                  const endBit   = (fuHdr & 0x40) !== 0;
+                  const innerNt  = fuHdr & 0x1f;
+                  if (startBit) {
+                    fuNalLocal = innerNt;
+                    fuBuf = [new Uint8Array([(payload[0] & 0xe0) | innerNt]), payload.slice(2)];
+                  } else if (fuBuf) {
+                    fuBuf.push(payload.slice(2));
+                  }
+                  if (endBit && fuBuf) {
+                    const totalLen = fuBuf.reduce((a, b) => a + b.length, 0);
+                    const nal = new Uint8Array(totalLen);
+                    let off = 0;
+                    fuBuf.forEach(c => { nal.set(c, off); off += c.length; });
+                    fuBuf = null;
+                    if (fuNalLocal === 5) bwHasIDR = true;
+                    if (!bwHasIDR) return;
+                    if (pktNum <= 10 || pktNum % 300 === 0)
+                      log('[broadway] recv#' + idx + ' pkt#' + pktNum + ' FU-A nal=' + fuNalLocal + ' ' + nal.length + 'B');
+                    bwDecoder.decode(nal);
+                  }
+                } else if (naluType === 24) {
+                  // STAP-A: multiple NAL units in one RTP packet
+                  let off = 1;
+                  while (off + 2 <= payload.length) {
+                    const size = (payload[off] << 8) | payload[off + 1];
+                    off += 2;
+                    if (off + size > payload.length) break;
+                    const nal = payload.slice(off, off + size);
+                    off += size;
+                    const nt = nal[0] & 0x1f;
+                    if (nt === 7 || nt === 8) {         // SPS / PPS
+                      bwDecoder.decode(nal);
+                      log('[broadway] STAP-A nal=' + nt + ' (SPS/PPS) ' + size + 'B');
+                    } else if (nt === 5) {               // IDR
+                      bwHasIDR = true;
+                      bwDecoder.decode(nal);
+                    } else if (bwHasIDR) {               // P/B after IDR
+                      bwDecoder.decode(nal);
+                    }
+                  }
+                } else {
+                  // Single NAL unit
+                  const isIDR = (naluType === 5);
+                  const isSPS = (naluType === 7);
+                  const isPPS = (naluType === 8);
+                  if (isIDR) bwHasIDR = true;
+                  if (isSPS || isPPS || isIDR || bwHasIDR) {
+                    if (pktNum <= 10 || pktNum % 300 === 0)
+                      log('[broadway] recv#' + idx + ' pkt#' + pktNum + ' nal=' + naluType + ' ' + payload.length + 'B');
+                    bwDecoder.decode(payload);
+                  }
+                }
+              }
+
+              if (typeof RTCRtpScriptTransform !== 'undefined') {
+                try {
+                  const worker = new Worker(workerUrl);
+                  worker.onmessage = (e) => {
+                    const { data, ft } = e.data;
+                    // Hex dump first 10 packets for diagnosis
+                    if (totalPktCount < 10) {
+                      const hex = Array.from(data.slice(0, 8))
+                        .map(b => b.toString(16).padStart(2, '0')).join(' ');
+                      log('[broadway] recv#' + idx + ' len=' + data.length +
+                          ' nal=' + (data.length ? (data[0] & 0x1f) : '?') +
+                          ' type=' + ft + ' [' + hex + ']');
+                    }
+                    processPayload(data);
+                  };
+                  worker.onerror = (e) => log('[broadway] recv#' + idx + ' worker err: ' + e.message);
+                  recv.transform = new RTCRtpScriptTransform(worker);
+                  log('[broadway] recv#' + idx + ' RTCRtpScriptTransform installed');
+                } catch (e) {
+                  log('[broadway] recv#' + idx + ' transform err: ' + e.message);
+                }
+              } else {
+                log('[broadway] RTCRtpScriptTransform unavailable — no software decode path');
+              }
+            });
+
+            // ── IDR recovery timer ────────────────────────────────────────────
+            // Polls every 5 s until first IDR arrives.
+            // Uses requestKeyFrame() on all receivers + periodic RTM askVersion.
+            const idrTimer = setInterval(() => {
+              if (bwHasIDR) {
+                clearInterval(idrTimer);
+                log('[broadway] IDR arrived — recovery timer cleared');
+                return;
+              }
+              idrRetries++;
+              log('[broadway] no IDR yet (retry#' + idrRetries + ')');
+              try {
+                pc.getReceivers().forEach(r => {
+                  try { if (r.requestKeyFrame) r.requestKeyFrame(); } catch(_) {}
+                });
+              } catch(_) {}
+              if (idrRetries % 3 === 0 && window._rtmSendAskVer) {
+                window._rtmSendAskVer().catch(() => {});
+                log('[broadway] re-sent askVersion via RTM (IDR retry#' + idrRetries + ')');
+              }
+              if (idrRetries >= 30) {
+                clearInterval(idrTimer);
+                log('[broadway] IDR timeout after 30 retries — giving up');
+              }
+            }, 5000);
+
+            log('[broadway] setup complete — installed on ' + receivers.length + ' receiver(s)');
+          } catch (e) {
+            log('[broadway] fatal setup error: ' + e.message);
+          }
+        })(0);
+      }
+
       // Reset broadwayActive when robot unpublishes so next user-published does full reinit.
       rtcClient.on('user-unpublished', (user, mediaType) => {
         log('[rtc] user-unpublished uid=' + user.uid + ' mediaType=' + mediaType);
@@ -571,16 +848,17 @@
 
       rtcClient.on('user-published', async (user, mediaType) => {
         if (mediaType === 'audio') {
-          // v0.1.67: Do NOT subscribe to audio. v0.1.68: IDR recovery added.
-          // Key insight from v0.1.66 test: when audio IS subscribed, Agora negotiates
-          // OPUS (pt=109) for audio, and the robot sends proper OPUS on SSRC=20000.
-          // BUT the H264 video (SSRC=40000 PT=0) completely disappears — robot/edge stops
-          // sending it when a proper audio codec is negotiated.
-          // When audio is NOT subscribed, Agora leaves audio unconfirmed and the robot
-          // sends H264 video on PT=0 (PCMU static slot) SSRC=40000 via the audio receiver.
-          // That H264/PT=0 stream is what Broadway intercepts.
-          // Conclusion: skip audio subscription to keep H264/PT=0 routing working.
+          // v0.1.67: Do NOT subscribe to audio — subscribing causes Agora to negotiate
+          // OPUS and the robot stops sending H264/PT=0 on the audio receiver.
+          // v0.1.73: When audio is NOT subscribed, the robot ONLY fires user-published
+          // for audio (H264/PT=0 via PCMU slot). video user-published never fires.
+          // We must install Broadway directly from this audio handler.
           log('[audio] skip subscription — needed to preserve H264/PT=0 routing to audio receiver');
+          if (!broadwayActive) {
+            broadwayActive = true;
+            // 400 ms delay: let Agora finish SDP exchange and create PC receivers
+            setTimeout(() => installBroadway(), 400);
+          }
           return;
         }
         if (mediaType !== 'video') return;
@@ -601,387 +879,20 @@
 
         const remoteTrack = user.videoTrack;
 
-        // ── Canvas capture — Firefox decodes H.264 via built-in OpenH264 ──────
-        // Firefox (Playwright) ships OpenH264 (Cisco) for WebRTC on all platforms
-        // including ARM64 — no proprietary codec package needed.
-
-        const FPS        = cfg.fps || 15;
-        const QUALITY    = cfg.jpeg_quality || 0.7;
-        const minInterval = 1000 / FPS;
-        const grabCanvas = document.getElementById('grab');
-        const grabCtx    = grabCanvas.getContext('2d');
-        let capturedFrames = 0, firstFrameLogged = false, lastSendTs = 0;
-
-        // Let Agora render into our container div.
+        // Let Agora render into our container div (video path only).
         const container = document.getElementById('remote-container');
-        try {
-          await remoteTrack.play(container);
-          log('[video] remoteTrack.play() OK');
-        } catch (e) {
-          log('[video] remoteTrack.play() error: ' + e.message);
-        }
-
-        // ── PC finder (used by frame-counter transform AND periodic stats) ─────
-        // Agora SDK uses two RTCPeerConnections internally (pub + sub).
-        // We must find the SUBSCRIBING PC — the one whose video receiver is live.
-        // Strategy: first scan for a PC that has a live video receiver (sub PC);
-        // fall back to the first PC found if none has a live video receiver.
-        const isPC = (o) => o && typeof o === 'object' &&
-          typeof o.getStats === 'function' && typeof o.getReceivers === 'function';
-        function findPC(obj, d, wantVideo) {
-          if (d > 7 || !obj || typeof obj !== 'object') return null;
-          if (isPC(obj)) {
-            if (!wantVideo) return obj;
-            try {
-              const hasLiveVideo = obj.getReceivers().some(
-                r => r.track && r.track.kind === 'video' && r.track.readyState === 'live'
-              );
-              if (hasLiveVideo) return obj;
-            } catch (_) {}
-            return null;
+        if (remoteTrack) {
+          try {
+            await remoteTrack.play(container);
+            log('[video] remoteTrack.play() OK');
+          } catch (e) {
+            log('[video] remoteTrack.play() error: ' + e.message);
           }
-          try { for (const k of Object.keys(obj)) {
-            try { const v = obj[k];
-              if (v && typeof v === 'object' && !Array.isArray(v)) {
-                const r = findPC(v, d + 1, wantVideo); if (r) return r; }
-            } catch (_) {}
-          }} catch (_) {}
-          return null;
         }
-        // Find sub PC first (has live video receiver); fall back to any PC.
-        const findBestPC = (obj) => findPC(obj, 0, true) || findPC(obj, 0, false);
 
-        // ── Broadway H264 decoder — intercepts H264 from audio receiver ──────
-        // ROOT CAUSE (confirmed v0.1.61): Agora edge sends H264 on PT=0.
-        // Firefox treats PT=0 as static PCMU (RFC 3551) and routes ALL packets
-        // with PT=0 to the audio m-section receiver, regardless of a=rtpmap overrides.
-        // Result: audio inbound-rtp gets bytes=5.6 MB but framesDecoded=0 (PCMU audio decode).
-        // Fix: RTCRtpScriptTransform on the audio receiver extracts raw H264 RTP payloads.
-        //   We reassemble FU-A/STAP-A fragments and decode with Broadway.js (Emscripten
-        //   H264 decoder compiled to WASM, included in the bridge directory).
-        //   Broadway outputs RGBA pixels → drawn to grabCanvas → existing WS capture pipeline.
-        try {
-          if (typeof Decoder === 'undefined') {
-            log('[broadway] Decoder not available — broadway.js not loaded');
-          } else {
-            const bwDecoder = new Decoder({ rgb: true });
-            let bwFirstFrame = false;
-            let lastBwSendTs = 0;
-            let bwPacketCount = 0;   // packets fed to processH264Payload
-            let bwHasIDR = false;    // true once we see nalType 5/7/8
-            let idrRetries = 0;      // how many times we've tried IDR recovery
-
-            bwDecoder.onDecoderReady = function() {
-              log('[broadway] ✓ WASM decoder ready (avc.wasm loaded)');
-            };
-
-            bwDecoder.onPictureDecoded = function(buffer, width, height /*, infos */) {
-              if (!bwFirstFrame) {
-                bwFirstFrame = true;
-                log('[broadway] ✓ FIRST FRAME decoded: ' + width + 'x' + height);
-                firstFrameLogged = true; // suppress duplicate tick() log
-              }
-              // Resize grabCanvas to match decoded frame
-              if (grabCanvas.width !== width || grabCanvas.height !== height) {
-                grabCanvas.width = width;
-                grabCanvas.height = height;
-              }
-              // Write RGBA pixels directly to canvas (Decoder({rgb:true}) outputs width*height*4 RGBA)
-              try {
-                const imgData = grabCtx.createImageData(width, height);
-                imgData.data.set(buffer);
-                grabCtx.putImageData(imgData, 0, 0);
-                capturedFrames++;
-              } catch(e) { log('[broadway] canvas error: ' + e.message); return; }
-              // Send frame at configured FPS via WebSocket
-              if (ws.readyState === 1) {
-                const now = Date.now();
-                if (now - lastBwSendTs >= minInterval) {
-                  lastBwSendTs = now;
-                  grabCanvas.toBlob((blob) => {
-                    if (!blob) return;
-                    blob.arrayBuffer().then((buf) => {
-                      if (ws.readyState === 1) ws.send(buf);
-                    });
-                  }, 'image/jpeg', QUALITY);
-                }
-              }
-            };
-
-            // ── H264 RTP reassembler ─────────────────────────────────────────
-            // RFC 6184: H264 RTP payloads may be single NAL (type 1-23),
-            // STAP-A (type 24, multiple NALs in one packet), or
-            // FU-A (type 28, one NAL fragmented across multiple packets).
-            //
-            // v0.1.67 FU-A fix: Firefox RTCRtpScriptTransform metadata does NOT
-            // expose rtpTimestamp (fields: contributingSources, payloadType,
-            // sequenceNumber, synchronizationSource only).
-            // Previous code used timestamp-keyed map → all keys = "0" or seq counter
-            // → fragments never matched → FU-A never decoded.
-            // Fix: single running buffer — no timestamp needed for in-order delivery
-            // (Agora SDK jitter buffer guarantees ordered delivery to the transform).
-            let fuBuf = null;  // current FU-A running buffer (Uint8Array | null)
-            let _seenNalTypes = {};
-            const MAX_IDR_RETRIES = 4;
-
-            function feedNAL(nal) {
-              const ab = new Uint8Array(4 + nal.length);
-              ab[0] = 0; ab[1] = 0; ab[2] = 0; ab[3] = 1;
-              ab.set(nal, 4);
-              bwDecoder.decode(ab);
-            }
-
-            // Pre-feed SPS+PPS from SDP sprop-parameter-sets if present.
-            // The robot may NEVER send SPS/PPS in-band (only via SDP out-of-band delivery).
-            // Without this, Broadway never receives codec params → cannot decode any frame.
-            function prefeedSpropParams() {
-              try {
-                const spsB64 = window._spropSPS, ppsB64 = window._spropPPS;
-                if (spsB64) {
-                  const s = atob(spsB64);
-                  feedNAL(new Uint8Array(s.length).map((_,i) => s.charCodeAt(i)));
-                  log('[broadway] pre-fed SPS from sprop (' + spsB64.length + ' b64 chars)');
-                }
-                if (ppsB64) {
-                  const p = atob(ppsB64);
-                  feedNAL(new Uint8Array(p.length).map((_,i) => p.charCodeAt(i)));
-                  log('[broadway] pre-fed PPS from sprop (' + ppsB64.length + ' b64 chars)');
-                }
-                if (!spsB64 && !ppsB64) log('[broadway] no sprop-parameter-sets in SDP — waiting for in-band SPS/PPS');
-              } catch(e) { log('[broadway] sprop pre-feed err: ' + e.message); }
-            }
-            prefeedSpropParams();
-
-            function processH264Payload(ts, payload, frameType) {
-              if (!payload || payload.length === 0) return;
-              bwPacketCount++;
-
-              // ── Path A: assembled video frame from RTCEncodedVideoFrame ─────────
-              // When H264/PT=0 reaches video receiver (via SSRC=40000 routing),
-              // Firefox assembles RTP→H264 and delivers complete frames to the transform.
-              // Data may be Annex-B (00 00 00 01 prefix) or AVCC (4-byte length prefix).
-              // Just feed directly to Broadway — no FU-A reassembly needed.
-              if (frameType === 'key' || frameType === 'delta') {
-                if (!bwHasIDR && frameType === 'key') {
-                  bwHasIDR = true;
-                  log('[broadway] ✓ video key-frame (IDR) at pkt#' + bwPacketCount + ' sz=' + payload.length);
-                }
-                // Detect format and decode
-                if (payload[0] === 0 && payload[1] === 0 && payload[2] === 0 && payload[3] === 1) {
-                  // Annex-B 4-byte start code — feed directly
-                  try { bwDecoder.decode(payload); } catch(_) {}
-                } else if (payload[0] === 0 && payload[1] === 0 && payload[2] === 1) {
-                  // Annex-B 3-byte start code — prepend 0x00
-                  const ab = new Uint8Array(payload.length + 1);
-                  ab[0] = 0; ab.set(payload, 1);
-                  try { bwDecoder.decode(ab); } catch(_) {}
-                } else {
-                  // Assume AVCC: [4-byte length][NAL data]+
-                  let off = 0;
-                  while (off + 4 <= payload.length) {
-                    const len = (payload[off]<<24)|(payload[off+1]<<16)|(payload[off+2]<<8)|payload[off+3];
-                    off += 4;
-                    if (len > 0 && off + len <= payload.length) feedNAL(payload.subarray(off, off + len));
-                    off += len;
-                  }
-                }
-                return;
-              }
-
-              // ── Path B: raw RTP payload from RTCEncodedAudioFrame ───────────────
-              // H264/PT=0 arrives on audio receiver as raw RTP payload.
-              // Need FU-A/STAP-A reassembly.
-              const nalType = payload[0] & 0x1F;
-
-              // IDR / SPS / PPS arrival — log every time (not just once)
-              if (nalType === 5 || nalType === 7 || nalType === 8) {
-                if (!bwHasIDR) {
-                  bwHasIDR = true;
-                  log('[broadway] ✓ IDR/SPS/PPS arrived: nalType=' + nalType + ' at pkt#' + bwPacketCount);
-                }
-              }
-
-              // Log each new NAL type once for diagnosis
-              if (!_seenNalTypes[nalType]) {
-                _seenNalTypes[nalType] = true;
-                log('[broadway] new nalType=' + nalType + ' firstBytes=' +
-                  Array.from(payload.slice(0, Math.min(6, payload.length))).map(x=>x.toString(16).padStart(2,'0')).join(' ') + ' ts=' + ts);
-              }
-
-              if (nalType >= 1 && nalType <= 23) {
-                // Single NAL — any non-IDR fragment resets pending FU-A
-                fuBuf = null;
-                feedNAL(payload);
-              } else if (nalType === 24) {
-                // STAP-A: multiple NALs concatenated
-                fuBuf = null;
-                let off = 1;
-                while (off + 2 <= payload.length) {
-                  const sz = (payload[off] << 8) | payload[off + 1]; off += 2;
-                  if (sz > 0 && off + sz <= payload.length) feedNAL(payload.subarray(off, off + sz));
-                  off += sz;
-                }
-              } else if (nalType === 28) {
-                // FU-A fragmented NAL
-                if (payload.length < 2) return;
-                const fuH = payload[1];
-                const S = (fuH >> 7) & 1, E = (fuH >> 6) & 1;
-                const fragNalType = fuH & 0x1F;
-                const nalHdr = (payload[0] & 0xE0) | fragNalType;
-
-                if (S) {
-                  // Start of new fragmented NAL — allocate with Annex-B header + nalHdr + first data
-                  const buf = new Uint8Array(4 + 1 + payload.length - 2);
-                  buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 1;
-                  buf[4] = nalHdr;
-                  buf.set(payload.subarray(2), 5);
-                  fuBuf = buf;
-                  // FU-A IDR detection: fragNalType=5/7/8 inside FU-A
-                  if ((fragNalType === 5 || fragNalType === 7 || fragNalType === 8) && !bwHasIDR) {
-                    bwHasIDR = true;
-                    log('[broadway] ✓ IDR/SPS/PPS in FU-A: fragNalType=' + fragNalType + ' at pkt#' + bwPacketCount);
-                  }
-                } else if (fuBuf) {
-                  // Continue — append data (skip 2-byte FU indicator+header)
-                  const prev = fuBuf;
-                  const next = new Uint8Array(prev.length + payload.length - 2);
-                  next.set(prev);
-                  next.set(payload.subarray(2), prev.length);
-                  fuBuf = next;
-                }
-                // End bit — decode the assembled NAL
-                if (E && fuBuf) {
-                  try { bwDecoder.decode(fuBuf); } catch(_) {}
-                  fuBuf = null;
-                }
-              }
-              // nalType 0, 25-27, 29-31 → unsupported/reserved, ignore
-            }
-
-            // Install RTCRtpScriptTransform on ALL receivers.
-            // H264/PT=0 routing depends on Firefox's SSRC/PT demux which can vary:
-            // – If fixSsrc40000 works → SSRC=40000 goes to video receiver
-            // – If PT-based fallback → PT=0 goes to audio receiver
-            // We install on every receiver; the PT=0 filter in the worker ensures
-            // only H264 data reaches processH264Payload.
-            const _pcAud = findBestPC(rtcClient);
-            const _allRecvs = (_pcAud && _pcAud.getReceivers) ? _pcAud.getReceivers() : [];
-
-            if (_allRecvs.length > 0 && typeof RTCRtpScriptTransform !== 'undefined') {
-              // Build worker source once, reuse for all receivers (same code, different instance)
-              const makeWorkerSrc = (recvLabel) => `
-                onrtctransform = ({transformer}) => {
-                  const label = ${JSON.stringify(recvLabel)};
-                  self.postMessage(label + ' xform-started');
-                  const rd = transformer.readable.getReader();
-                  const wr = transformer.writable.getWriter();
-                  let n = 0;
-                  let metaLogged = false;
-                  (function pump() {
-                    rd.read().then(({done, value}) => {
-                      if (done) { self.postMessage(label + ' xform-done'); return; }
-                      n++;
-                      const sz = value.data ? value.data.byteLength : 0;
-                      const meta = value.getMetadata();
-                      if (!metaLogged && meta) {
-                        metaLogged = true;
-                        self.postMessage(label + ' meta: ' + JSON.stringify(meta));
-                      }
-                      const ts = (meta.rtpTimestamp !== undefined) ? meta.rtpTimestamp
-                               : (meta.timestamp     !== undefined) ? meta.timestamp : n;
-                      const seq = meta.sequenceNumber !== undefined ? meta.sequenceNumber : n;
-                      const pt  = meta.payloadType;
-                      const ssrc = meta.synchronizationSource;
-                      if (n % 1000 === 1)
-                        self.postMessage(label + ' periodic-meta pkt#' + n + ' ssrc=' + ssrc + ' pt=' + pt + ' sz=' + sz);
-                      if (pt !== undefined && pt !== 0) {
-                        wr.write(value).then(pump).catch(() => pump());
-                        return;
-                      }
-                      // PT=0: this is the H264 stream — log first few packets
-                      if (n <= 3 || n % 1000 === 1) {
-                        self.postMessage(label + ' H264-pkt#' + n + ' sz=' + sz + ' ssrc=' + ssrc);
-                      }
-                      if ((n <= 3 || n % 1000 === 1) && value.data && sz >= 4) {
-                        const b = new Uint8Array(value.data);
-                        const hexDump = Array.from(b.slice(0, Math.min(32, sz)))
-                          .map(x=>x.toString(16).padStart(2,'0')).join(' ');
-                        self.postMessage(label + ' hex-dump pkt#' + n + ' [' + hexDump + ']');
-                      }
-                      const payload = new Uint8Array(value.data).slice();
-                      // value.type is defined for RTCEncodedVideoFrame ('key'/'delta'),
-                      // undefined for RTCEncodedAudioFrame. Pass frameType so main thread
-                      // can use the correct decode path (video=assembled Annex-B/AVCC,
-                      // audio=raw RTP payload requiring FU-A reassembly).
-                      const frameType = (value.type !== undefined) ? value.type : 'audio';
-                      self.postMessage({ts, seq, data: payload, frameType}, [payload.buffer]);
-                      wr.write(value).then(pump).catch(() => pump());
-                    }).catch(e => self.postMessage(label + ' xform-err ' + e));
-                  })();
-                };
-              `;
-
-              _allRecvs.forEach((recv, idx) => {
-                const kind = recv.track ? recv.track.kind : '?';
-                const label = 'recv#' + idx + '(' + kind + ')';
-                try {
-                  const w = new Worker(
-                    URL.createObjectURL(new Blob([makeWorkerSrc(label)], {type:'text/javascript'}))
-                  );
-                  w.onmessage = ({data}) => {
-                    if (typeof data === 'string') { log('[broadway] ' + data); return; }
-                    if (data && data.ts !== undefined && data.data)
-                      processH264Payload(data.ts, new Uint8Array(data.data), data.frameType || 'audio');
-                  };
-                  recv.transform = new RTCRtpScriptTransform(w);
-                  log('[broadway] RTCRtpScriptTransform installed on ' + label);
-                } catch(e) {
-                  log('[broadway] transform install FAILED on ' + label + ': ' + e.message);
-                }
-              });
-
-              // IDR recovery (reuse first receiver reference for requestKeyFrame)
-              const _anyRecv = _allRecvs[0];
-
-              // ── IDR recovery ──────────────────────────────────────────────────
-              function requestIDR() {
-                if (bwFirstFrame) return;
-                idrRetries++;
-                log('[broadway] IDR recovery #' + idrRetries +
-                  ': pkts=' + bwPacketCount + ' hasIDR=' + bwHasIDR);
-                if (idrRetries > MAX_IDR_RETRIES) {
-                  log('[broadway] gave up — no IDR after ' + MAX_IDR_RETRIES + ' attempts');
-                  return;
-                }
-                // RTCP PLI via requestKeyFrame() on all receivers
-                _allRecvs.forEach((recv, i) => {
-                  if (recv && typeof recv.requestKeyFrame === 'function') {
-                    try { recv.requestKeyFrame(); log('[broadway] requestKeyFrame() on recv#' + i); }
-                    catch(e) { log('[broadway] requestKeyFrame() err recv#' + i + ': ' + e.message); }
-                  } else {
-                    log('[broadway] requestKeyFrame() N/A on recv#' + i + ' (' + (recv.track&&recv.track.kind) + ')');
-                  }
-                });
-                // NOTE: No unsubscribe+subscribe here — it was causing sessions to break.
-                // If robot doesn't respond to PLI, user-unpublished+user-published will
-                // eventually trigger a fresh stream with new SPS+PPS+IDR.
-              }
-              // Schedule IDR check: 2s after transform install, retry every 8s (max MAX_IDR_RETRIES times)
-              setTimeout(function checkIDR() {
-                if (bwFirstFrame) return;
-                if (idrRetries >= MAX_IDR_RETRIES) return;
-                if (bwPacketCount > 30) requestIDR();
-                else log('[broadway] IDR check: no packets yet (' + bwPacketCount + ')');
-                setTimeout(checkIDR, 8000);
-              }, 2000);
-            } else {
-              log('[broadway] WARN: receivers=' + _allRecvs.length +
-                ' RTCRtpScriptTransform=' + (typeof RTCRtpScriptTransform !== 'undefined'));
-            }
-          }
-        } catch(e) {
-          log('[broadway] setup error: ' + e.message);
-        }
+        // Install Broadway H264 decoder (shared with audio path).
+        // installBroadway() defined at startAgora scope (before user-published listener).
+        installBroadway();
 
         // ── Frame-counter removed (v0.1.71): Broadway now installs on ALL receivers
         // and logs per-receiver info (recv#N meta, H264-pkt#N, hex-dump) directly.
