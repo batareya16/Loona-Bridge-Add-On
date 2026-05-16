@@ -298,41 +298,99 @@ function findSdkFile(pkgName, candidates) {
 
   const page = await context.newPage();
 
-  // ── Track C: H265 → JPEG via Node.js ffmpeg ──────────────────────────────────
-  // WebCodecs VideoDecoder doesn't support H265 on Linux ARM64 without VA-API.
-  // GStreamer avdec_h265 may not be available in the HA base image.
-  // This fallback decodes H265 Annex B in Node.js (ffmpeg subprocess) and injects
-  // JPEG frames back into the page, which sends them to the Python HA Core socket.
+  // ── Track C: H265 → JPEG via Node.js ffmpeg + direct Python WS ───────────────
   //
-  // Flow: bridge.html RTCRtpScriptTransform → reassemble FU/AP → Annex B →
-  //       window.__h265FeedNAL(base64) → [IPC] → bridge.js → ffmpeg stdin →
-  //       ffmpeg stdout JPEG → page.evaluate(window.__nodeJpegReady) → ws.send
-  const cp = require('child_process');
-  let ffH265 = null, ffBuf = Buffer.alloc(0);
+  // Optimised flow (v0.1.81):
+  //   bridge.html RTCRtpScriptTransform → reassemble FU/AP → Annex B →
+  //   window.__h265FeedNAL(base64) → [CDP IPC] → bridge.js → ffmpeg stdin →
+  //   ffmpeg stdout JPEG → bridge.js WS → Python  (binary, no base64, no page.evaluate)
+  //
+  // Key changes vs previous:
+  //   • bridge.js opens its own WebSocket to Python and sends JPEG as raw binary.
+  //     Eliminates: page.evaluate per frame, base64 encode/decode, Firefox WS send.
+  //   • Hardware H265 decode (hevc_v4l2m2m) attempted first on ARM64;
+  //     auto-falls back to software if the device is unavailable.
+  //   • bridge.html WS is now used only for agora_config receive + RTM messages.
+
+  const cp  = require('child_process');
+  const WS  = require('ws');
+
+  // ── Direct Python WebSocket (JPEG forwarding) ─────────────────────────────────
+  const pyWsUrl    = `ws://${cfg.ws_host || '127.0.0.1'}:${cfg.ws_port}`;
+  let   pyWs       = null;
+  let   pyWsReady  = false;
+  let   firstJpeg  = true;
+  const minIntervalMs = Math.floor(1000 / Math.max(1, cfg.fps || 10));
+  let   lastSendMs    = 0;
+
+  function openPyWs() {
+    const sock = new WS(pyWsUrl);
+    sock.on('open', () => {
+      pyWs      = sock;
+      pyWsReady = true;
+      console.error('[pyWs] connected to Python at ' + pyWsUrl);
+    });
+    sock.on('close', () => {
+      pyWs      = null;
+      pyWsReady = false;
+      setTimeout(openPyWs, 3000);
+    });
+    sock.on('error', () => {});   // close event fires anyway
+  }
+  openPyWs();
+
+  // ── ffmpeg H265 decoder ────────────────────────────────────────────────────────
+  let ffH265   = null;
+  let ffBuf    = Buffer.alloc(0);
+  let useHwDec = (process.arch === 'arm64');  // try V4L2M2M on ARM64 first
+
+  const FF_STDIN_MAX = 256 * 1024;  // 256 KB — kill+restart if stdin backs up
+
+  function buildFfArgs() {
+    const hw = useHwDec ? ['-c:v', 'hevc_v4l2m2m'] : [];
+    return [
+      '-loglevel', 'error',
+      '-fflags', '+nobuffer+discardcorrupt',
+      '-flags', '+low_delay',
+      '-analyzeduration', '0',
+      '-probesize', '32',
+      '-f', 'hevc',
+      ...hw,
+      '-i', 'pipe:0',
+      '-f', 'image2pipe',
+      '-vcodec', 'mjpeg',
+      '-q:v', '4',
+      '-an',
+      'pipe:1',
+    ];
+  }
 
   function startFfmpeg() {
     if (ffH265) return;
-    ffH265 = cp.spawn('ffmpeg', [
-      '-loglevel', 'error',
-      '-f', 'hevc',        // raw H265 Annex B stream from stdin
-      '-i', 'pipe:0',
-      '-f', 'image2pipe',  // stream of individual image frames
-      '-vcodec', 'mjpeg',  // JPEG output
-      '-q:v', '4',         // quality 1–31, lower=better (4 ≈ 85%)
-      '-an',               // no audio
-      'pipe:1',
-    ], { stdio: ['pipe', 'pipe', 'inherit'] });
+    const args = buildFfArgs();
+    if (useHwDec)
+      console.error('[ffmpeg] trying hardware H265 decode (hevc_v4l2m2m)');
+
+    ffH265 = cp.spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'inherit'] });
 
     ffH265.stdin.on('error', () => {});
-    ffH265.on('error', (e) => console.error('[ffmpeg] ' + e.message));
+    ffH265.on('error', (e) => console.error('[ffmpeg] spawn error: ' + e.message));
     ffH265.on('exit', (code) => {
-      console.error('[ffmpeg] exited code=' + code + ' — will restart on next NAL');
+      if (code !== 0 && useHwDec) {
+        console.error('[ffmpeg] hw decode failed (code=' + code +
+                      ') — switching to software decode');
+        useHwDec = false;
+      } else {
+        console.error('[ffmpeg] exited code=' + code + ' — restart on next NAL');
+      }
       ffH265 = null;
+      ffBuf  = Buffer.alloc(0);
     });
 
+    // ── JPEG output: drain buffer, send only the latest frame ─────────────────
     ffH265.stdout.on('data', (chunk) => {
       ffBuf = Buffer.concat([ffBuf, chunk]);
-      // Scan for complete JPEG frames: SOI=0xFF 0xD8 ... EOI=0xFF 0xD9
+      let latestJpeg = null;
       while (true) {
         let soi = -1;
         for (let i = 0; i + 1 < ffBuf.length; i++) {
@@ -344,26 +402,49 @@ function findSdkFile(pkgName, candidates) {
           if (ffBuf[i] === 0xFF && ffBuf[i + 1] === 0xD9) { eoi = i; break; }
         }
         if (eoi < 0) { if (soi > 0) ffBuf = ffBuf.slice(soi); break; }
-        const jpeg = ffBuf.slice(soi, eoi + 2);
-        ffBuf = ffBuf.slice(eoi + 2);
-        // Inject JPEG into page → window.__nodeJpegReady → ws.send to Python
-        page.evaluate((b64) => {
-          if (typeof window.__nodeJpegReady === 'function') window.__nodeJpegReady(b64);
-        }, jpeg.toString('base64')).catch(() => {});
+        latestJpeg = ffBuf.slice(soi, eoi + 2);
+        ffBuf      = ffBuf.slice(eoi + 2);
+      }
+      if (!latestJpeg) return;
+
+      // Rate-limit + send binary directly to Python — no page.evaluate needed.
+      const now = Date.now();
+      if (now - lastSendMs < minIntervalMs) return;
+      lastSendMs = now;
+
+      if (pyWsReady && pyWs.readyState === WS.OPEN) {
+        pyWs.send(latestJpeg, { binary: true });
+        if (firstJpeg) {
+          firstJpeg = false;
+          console.error('[ffmpeg] ✓ first JPEG sent to Python (' +
+                        latestJpeg.length + ' B, hw=' + !useHwDec + ')');
+          // Notify bridge.html for its log/counters (no WS send needed there).
+          page.evaluate(() => {
+            if (typeof window.__onFirstFrame === 'function') window.__onFirstFrame();
+          }).catch(() => {});
+        }
       }
     });
 
-    console.error('[ffmpeg] H265 decoder started pid=' + ffH265.pid);
+    console.error('[ffmpeg] H265 decoder started pid=' + ffH265.pid +
+                  ' hw=' + useHwDec);
   }
 
-  // Exposed to bridge.html: receives base64-encoded H265 Annex B NAL unit.
-  // Fire-and-forget — no return value needed.
+  // ── H265 NAL feeder (called from bridge.html via RTCRtpScriptTransform) ───────
   await page.exposeFunction('__h265FeedNAL', (b64) => {
     if (!ffH265) startFfmpeg();
     if (ffH265 && !ffH265.stdin.destroyed) {
+      if (ffH265.stdin.writableLength > FF_STDIN_MAX) {
+        console.error('[ffmpeg] stdin overrun — killing to reset latency');
+        ffH265.kill();
+        return;
+      }
       try { ffH265.stdin.write(Buffer.from(b64, 'base64')); } catch (_) {}
     }
   });
+
+  // Simple ack so bridge.html can update its frame counter without WS.
+  await page.exposeFunction('__onFirstFrame', () => {});
 
   // No timeout — startAgora runs indefinitely.
   page.setDefaultTimeout(0);

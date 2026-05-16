@@ -415,26 +415,14 @@
       //   and run.sh re-reads bridge-config.json with the updated ws_port.
       let ws;
 
-      // ── Track C: Node.js ffmpeg JPEG injection hook ───────────────────────────
-      // bridge.js calls window.__nodeJpegReady(base64JPEG) when ffmpeg produces a
-      // decoded JPEG frame from the H265 Annex B stream fed via __h265FeedNAL.
-      window.__nodeJpegReady = (b64) => {
+      // ── Track C: first-frame notification from bridge.js ─────────────────────
+      // bridge.js now sends JPEG directly to Python via its own WS (no page.evaluate).
+      // __onFirstFrame() is called once by bridge.js so this page can update counters.
+      window.__onFirstFrame = () => {
         capturedFrames++;
         if (!firstFrameLogged) {
           firstFrameLogged = true;
-          log('[h265] ✓ FIRST FRAME — Node.js ffmpeg decode');
-        }
-        if (ws && ws.readyState === 1) {
-          const now = Date.now();
-          if (now - lastSendTs >= minInterval) {
-            lastSendTs = now;
-            try {
-              const raw = atob(b64);
-              const u8  = new Uint8Array(raw.length);
-              for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
-              ws.send(u8.buffer);
-            } catch(e) { log('[h265] nodeJpeg send err: ' + e.message); }
-          }
+          log('[h265] ✓ FIRST FRAME — Node.js ffmpeg → Python WS (direct)');
         }
       };
 
