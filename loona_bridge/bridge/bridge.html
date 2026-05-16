@@ -815,79 +815,87 @@
               // nalType 0, 25-27, 29-31 → unsupported/reserved, ignore
             }
 
-            // Install RTCRtpScriptTransform on the audio receiver.
-            // The audio receiver gets all H264 data (PT=0 → PCMU → audio by Firefox).
+            // Install RTCRtpScriptTransform on ALL receivers.
+            // H264/PT=0 routing depends on Firefox's SSRC/PT demux which can vary:
+            // – If fixSsrc40000 works → SSRC=40000 goes to video receiver
+            // – If PT-based fallback → PT=0 goes to audio receiver
+            // We install on every receiver; the PT=0 filter in the worker ensures
+            // only H264 data reaches processH264Payload.
             const _pcAud = findBestPC(rtcClient);
-            const _audRecv = _pcAud && _pcAud.getReceivers &&
-              _pcAud.getReceivers().find(r => r.track && r.track.kind === 'audio');
+            const _allRecvs = (_pcAud && _pcAud.getReceivers) ? _pcAud.getReceivers() : [];
 
-            if (_audRecv && typeof RTCRtpScriptTransform !== 'undefined') {
-              const audWorkerSrc = `
+            if (_allRecvs.length > 0 && typeof RTCRtpScriptTransform !== 'undefined') {
+              // Build worker source once, reuse for all receivers (same code, different instance)
+              const makeWorkerSrc = (recvLabel) => `
                 onrtctransform = ({transformer}) => {
-                  self.postMessage('audio-xform-started');
+                  const label = ${JSON.stringify(recvLabel)};
+                  self.postMessage(label + ' xform-started');
                   const rd = transformer.readable.getReader();
                   const wr = transformer.writable.getWriter();
                   let n = 0;
                   let metaLogged = false;
                   (function pump() {
                     rd.read().then(({done, value}) => {
-                      if (done) { self.postMessage('audio-xform-done'); return; }
+                      if (done) { self.postMessage(label + ' xform-done'); return; }
                       n++;
                       const sz = value.data ? value.data.byteLength : 0;
-                      if (n <= 3 || n % 300 === 0)
-                        self.postMessage('audio-pkt#' + n + ' sz=' + sz);
                       const meta = value.getMetadata();
-                      // Log metadata keys once to discover field names in this Firefox version
                       if (!metaLogged && meta) {
                         metaLogged = true;
-                        self.postMessage('audio-meta-keys: ' + Object.keys(meta).join(','));
-                        self.postMessage('audio-meta: ' + JSON.stringify(meta));
+                        self.postMessage(label + ' meta: ' + JSON.stringify(meta));
                       }
-                      // Firefox may expose rtpTimestamp as 'rtpTimestamp' or 'timestamp'
                       const ts = (meta.rtpTimestamp !== undefined) ? meta.rtpTimestamp
-                               : (meta.timestamp     !== undefined) ? meta.timestamp
-                               : n; // fallback: use sequence number as unique key
+                               : (meta.timestamp     !== undefined) ? meta.timestamp : n;
                       const seq = meta.sequenceNumber !== undefined ? meta.sequenceNumber : n;
-                      // Filter: only forward PT=0 (H264 misidentified as PCMU).
-                      const pt = meta.payloadType;
+                      const pt  = meta.payloadType;
                       const ssrc = meta.synchronizationSource;
-                      // Periodic SSRC+PT diagnostic
                       if (n % 1000 === 1)
-                        self.postMessage('periodic-meta pkt#' + n + ' ssrc=' + ssrc + ' pt=' + pt + ' sz=' + sz);
+                        self.postMessage(label + ' periodic-meta pkt#' + n + ' ssrc=' + ssrc + ' pt=' + pt + ' sz=' + sz);
                       if (pt !== undefined && pt !== 0) {
-                        // Not PT=0 — real audio codec, not H264 — skip
                         wr.write(value).then(pump).catch(() => pump());
                         return;
                       }
-                      // Log first few payload bytes + hex dump for format diagnosis
-                      if ((n <= 3 || n % 1000 === 1) && value.data && value.data.byteLength >= 4) {
+                      // PT=0: this is the H264 stream — log first few packets
+                      if (n <= 3 || n % 1000 === 1) {
+                        self.postMessage(label + ' H264-pkt#' + n + ' sz=' + sz + ' ssrc=' + ssrc);
+                      }
+                      if ((n <= 3 || n % 1000 === 1) && value.data && sz >= 4) {
                         const b = new Uint8Array(value.data);
-                        const hexDump = Array.from(b.slice(0, Math.min(32, b.length)))
+                        const hexDump = Array.from(b.slice(0, Math.min(32, sz)))
                           .map(x=>x.toString(16).padStart(2,'0')).join(' ');
-                        self.postMessage('hex-dump pkt#' + n + ' [' + hexDump + ']');
+                        self.postMessage(label + ' hex-dump pkt#' + n + ' [' + hexDump + ']');
                       }
                       const payload = new Uint8Array(value.data).slice();
                       self.postMessage({ts: ts, seq: seq, data: payload}, [payload.buffer]);
                       wr.write(value).then(pump).catch(() => pump());
-                    }).catch(e => self.postMessage('audio-xform-err ' + e));
+                    }).catch(e => self.postMessage(label + ' xform-err ' + e));
                   })();
                 };
               `;
-              const audWorker = new Worker(
-                URL.createObjectURL(new Blob([audWorkerSrc], {type:'text/javascript'}))
-              );
-              audWorker.onmessage = ({data}) => {
-                if (typeof data === 'string') { log('[broadway] ' + data); return; }
-                if (data && data.ts !== undefined && data.data)
-                  processH264Payload(data.ts, new Uint8Array(data.data));
-              };
-              _audRecv.transform = new RTCRtpScriptTransform(audWorker);
-              log('[broadway] RTCRtpScriptTransform installed on audio receiver (H264/PT=0 intercept)');
 
-              // ── IDR recovery: robot sends SPS+PPS+IDR only at stream start,
-              // before our transform is ready → we miss them → only P-frames arrive.
-              // Fix: after 2s with packets but no IDR, request a keyframe (RTCP PLI)
-              // and eventually force unsubscribe+subscribe so robot restarts stream.
+              _allRecvs.forEach((recv, idx) => {
+                const kind = recv.track ? recv.track.kind : '?';
+                const label = 'recv#' + idx + '(' + kind + ')';
+                try {
+                  const w = new Worker(
+                    URL.createObjectURL(new Blob([makeWorkerSrc(label)], {type:'text/javascript'}))
+                  );
+                  w.onmessage = ({data}) => {
+                    if (typeof data === 'string') { log('[broadway] ' + data); return; }
+                    if (data && data.ts !== undefined && data.data)
+                      processH264Payload(data.ts, new Uint8Array(data.data));
+                  };
+                  recv.transform = new RTCRtpScriptTransform(w);
+                  log('[broadway] RTCRtpScriptTransform installed on ' + label);
+                } catch(e) {
+                  log('[broadway] transform install FAILED on ' + label + ': ' + e.message);
+                }
+              });
+
+              // IDR recovery (reuse first receiver reference for requestKeyFrame)
+              const _anyRecv = _allRecvs[0];
+
+              // ── IDR recovery ──────────────────────────────────────────────────
               function requestIDR() {
                 if (bwFirstFrame) return;
                 idrRetries++;
@@ -897,26 +905,23 @@
                   log('[broadway] IDR recovery: gave up after ' + MAX_IDR_RETRIES + ' retries — check robot stream');
                   return;
                 }
-                // Attempt 1: RTCP PLI via requestKeyFrame() (Firefox WebRTC-extensions)
-                if (_audRecv && typeof _audRecv.requestKeyFrame === 'function') {
-                  try {
-                    _audRecv.requestKeyFrame();
-                    log('[broadway] requestKeyFrame() sent → waiting for IDR...');
-                  } catch(e) { log('[broadway] requestKeyFrame() err: ' + e.message); }
-                } else {
-                  log('[broadway] requestKeyFrame() not available in this Firefox');
-                }
+                // Attempt: RTCP PLI via requestKeyFrame() (Firefox WebRTC-extensions)
+                _allRecvs.forEach((recv, i) => {
+                  if (recv && typeof recv.requestKeyFrame === 'function') {
+                    try { recv.requestKeyFrame(); log('[broadway] requestKeyFrame() sent on recv#' + i); }
+                    catch(e) { log('[broadway] requestKeyFrame() err recv#' + i + ': ' + e.message); }
+                  }
+                });
                 // Attempt 2+: force unsubscribe+subscribe → robot restarts stream fresh
                 if (idrRetries >= 2) {
                   log('[broadway] IDR recovery: forcing resubscription for new SPS+PPS+IDR burst...');
                   fuBuf = null; bwHasIDR = false; bwPacketCount = 0;
-                  _seenNalTypes = {};  // reset so we get fresh NAL type logs after resubscribe
+                  _seenNalTypes = {};
                   (async () => {
                     try {
                       await rtcClient.unsubscribe(user);
                       await new Promise(r => setTimeout(r, 600));
                       await rtcClient.subscribe(user, 'video');
-                      // Re-feed SPS+PPS from SDP so Broadway is ready for the new stream
                       prefeedSpropParams();
                       log('[broadway] IDR recovery: resubscribed → expect SPS+PPS+IDR');
                     } catch(e) {
@@ -928,13 +933,13 @@
               // Schedule IDR check: 2s after transform install, retry every 8s (max MAX_IDR_RETRIES times)
               setTimeout(function checkIDR() {
                 if (bwFirstFrame) return;
-                if (idrRetries >= MAX_IDR_RETRIES) return;  // stop after max retries
+                if (idrRetries >= MAX_IDR_RETRIES) return;
                 if (bwPacketCount > 30) requestIDR();
                 else log('[broadway] IDR check: no packets yet (' + bwPacketCount + ')');
                 setTimeout(checkIDR, 8000);
               }, 2000);
             } else {
-              log('[broadway] WARN: audio receiver=' + (!!_audRecv) +
+              log('[broadway] WARN: receivers=' + _allRecvs.length +
                 ' RTCRtpScriptTransform=' + (typeof RTCRtpScriptTransform !== 'undefined'));
             }
           }
@@ -942,53 +947,8 @@
           log('[broadway] setup error: ' + e.message);
         }
 
-        // ── Frame-counter RTCRtpScriptTransform (diagnostic on video receiver) ──
-        // If [xform] frame#N logs appear → jitter buffer IS assembling H264 frames
-        //   from RTP (depacketizer works) but GMP decoder fails → different issue.
-        // If NO [xform] frame#N → jitter buffer never assembles frames → depacketizer
-        //   bug (sps-pps-idr-in-keyframe or FU-A handling issue in Firefox 128).
-        try {
-          if (typeof RTCRtpScriptTransform !== 'undefined') {
-            const _pc = findBestPC(rtcClient);
-            const _vrecv = _pc && _pc.getReceivers &&
-              _pc.getReceivers().find(r => r.track && r.track.kind === 'video');
-            if (_vrecv) {
-              const _wSrc = `
-                self.postMessage('worker-started');
-                let xformFired = false;
-                setTimeout(() => {
-                  if (!xformFired) self.postMessage('xform-event NEVER FIRED after 15s');
-                }, 15000);
-                let n = 0;
-                onrtctransform = ({transformer}) => {
-                  xformFired = true;
-                  self.postMessage('xform-event fired');
-                  const rd = transformer.readable.getReader();
-                  const wr = transformer.writable.getWriter();
-                  (function pump() {
-                    rd.read().then(({done, value}) => {
-                      if (done) { self.postMessage('readable done'); return; }
-                      n++;
-                      if (n <= 5 || n % 60 === 0)
-                        self.postMessage('frame#' + n + ' type=' + value.type +
-                          ' sz=' + (value.data ? value.data.byteLength : 0));
-                      wr.write(value).then(pump);
-                    }).catch(e => self.postMessage('xform-err ' + e));
-                  })();
-                };`;
-              const _w = new Worker(URL.createObjectURL(new Blob([_wSrc], {type:'text/javascript'})));
-              _w.onmessage = ({data}) => log('[xform] ' + data);
-              _vrecv.transform = new RTCRtpScriptTransform(_w);
-              log('[xform] frame-counter installed on video receiver');
-            } else {
-              log('[xform] no video receiver found in PC');
-            }
-          } else {
-            log('[xform] RTCRtpScriptTransform not available in this Firefox');
-          }
-        } catch (e) {
-          log('[xform] setup error: ' + e.message);
-        }
+        // ── Frame-counter removed (v0.1.71): Broadway now installs on ALL receivers
+        // and logs per-receiver info (recv#N meta, H264-pkt#N, hex-dump) directly.
 
         // Wait up to 10 s for Agora's <video> to have decoded dimensions.
         // No dimensions = H.264 not decoding (check chromium-codecs-ffmpeg-extra).
