@@ -357,7 +357,12 @@ function findSdkFile(pkgName, candidates) {
   // the first decoded picture (B-frame reordering pipeline).
   let ffIdrWritten      = false;  // true after the startup IDR was sent to stdin
   let ffStartupNalCount = 0;      // NALs written during startup (including IDR)
-  const FF_STARTUP_NAL_MAX = 2;   // IDR + 1 P-frame — minimum to prime avdec_h265
+  // During NULL→PLAYING (1-4 s on Pi) fdsrc does not read stdin, so priming frames
+  // accumulate in the pipe buffer.  We write IDR + up to FF_STARTUP_NAL_MAX P-frames
+  // so avdec_h265 has enough material to fill its internal reorder buffer and flush.
+  // Increasing this reduces "init timeout" kills; the ffPendingFrames mechanism below
+  // cleans up the resulting startup backlog after the first JPEG arrives.
+  const FF_STARTUP_NAL_MAX = 10;  // IDR + 9 P-frames — enough for avdec_h265 to flush
   // ── Real-time latency control ──────────────────────────────────────────────────
   // Track frames written to stdin but not yet decoded (output as JPEG).
   // If the decoder falls behind, drop incoming frames rather than letting the
@@ -365,11 +370,13 @@ function findSdkFile(pkgName, candidates) {
   let ffPendingFrames   = 0;
   const MAX_PENDING_FRAMES = 3;   // ≈300 ms at 10 fps; drop incoming when exceeded
 
-  // First frame can take 3-5 s (V4L2M2M init or software codec startup).
+  // First frame can take up to 12 s on Pi (GStreamer NULL→PLAYING + avdec_h265 init).
   // After the first frame, 3 s silence = decode error → kill + wait for IDR.
   function resetNoOutputTimer() {
     clearTimeout(ffNoOutputTimer);
-    const ms = ffFirstFrameSeen ? 3000 : 5000;
+    // First-frame timeout: 12 s (GStreamer NULL→PLAYING on Pi ≈ 2-4 s + avdec_h265 init).
+    // Mid-stream stall timeout: 3 s (decoder should be outputting steadily by then).
+    const ms = ffFirstFrameSeen ? 3000 : 12000;
     ffNoOutputTimer = setTimeout(() => {
       if (ffH265) {
         console.error('[ffmpeg] no JPEG output for ' + (ms / 1000) +
@@ -459,11 +466,8 @@ function findSdkFile(pkgName, candidates) {
     ffH265.on('exit', (code, signal) => {
       clearTimeout(ffNoOutputTimer);
       if (signal) {
-        // Killed by our own kill() call (no-output timer or stdin overrun).
-        // NOT a hw decoder failure — don't disable useHwDec.
         console.error('[gst] killed (' + signal + ') — will restart on next IDR');
       } else if (code !== 0 && useHwDec) {
-        // Non-zero exit with hw enabled = real decoder error.
         console.error('[gst] hw decode error (code=' + code +
                       ') — switching to software (avdec_h265)');
         useHwDec = false;
@@ -472,6 +476,9 @@ function findSdkFile(pkgName, candidates) {
       }
       ffH265 = null;
       ffBuf  = Buffer.alloc(0);
+      // Ask Firefox to send PLI/FIR to the robot so a fresh IDR arrives quickly
+      // instead of waiting up to 5 s for the idrTimer.
+      page.evaluate('if (window._requestKeyFrame) window._requestKeyFrame()').catch(() => {});
     });
 
     // ── JPEG output: drain buffer, send only the latest frame ─────────────────

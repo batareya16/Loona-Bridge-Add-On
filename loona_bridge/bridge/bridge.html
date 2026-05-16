@@ -1341,6 +1341,20 @@
         const SUBCMD_JOIN   = 1;    // CONTROL_DRIVE_JOIN — tells robot a viewer is connecting
 
         // Expose senders for re-use after subscription / muted retries.
+        // Called from bridge.js (via page.evaluate) after each decoder kill/restart
+        // so Firefox sends PLI/FIR to the robot and a fresh IDR arrives quickly.
+        window._requestKeyFrame = function() {
+          try {
+            const pc = findBestPC(rtcClient);
+            if (pc) {
+              pc.getReceivers().forEach(r => {
+                try { if (r.requestKeyFrame) r.requestKeyFrame(); } catch(_) {}
+              });
+              log('[h265] requestKeyFrame sent (decoder restarted)');
+            }
+          } catch(_) {}
+        };
+
         window._rtmSendAskVer = async () => {
           await rtmClient.sendMessageToPeer(
             { rawMessage: makePacket(CMD_CONTROL, int32LE(SUBCMD_ASKVER)), description: 'askVersion' },
