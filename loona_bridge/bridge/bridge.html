@@ -1003,7 +1003,7 @@
                 return;
               }
               idrRetries++;
-              log('[h265] no IDR yet (retry#' + idrRetries + ')');
+              log('[h265] no IDR yet (retry#' + idrRetries + ') totalPkt=' + totalPktCount);
               try {
                 pc.getReceivers().forEach(r => {
                   try { if (r.requestKeyFrame) r.requestKeyFrame(); } catch(_) {}
@@ -1021,7 +1021,8 @@
 
             log('[h265] setup complete — ' + receivers.length + ' receiver(s),' +
                 ' VideoDecoder=' + (typeof VideoDecoder !== 'undefined') +
-                ' Broadway=' + !!bwDecoder);
+                ' Broadway=' + !!bwDecoder +
+                ' __h265FeedNAL=' + (typeof window.__h265FeedNAL));
           } catch (e) {
             log('[h265] fatal setup error: ' + e.message);
           }
