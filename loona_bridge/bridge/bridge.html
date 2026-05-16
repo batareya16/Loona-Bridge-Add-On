@@ -558,9 +558,16 @@
       });
 
       // Guard: Broadway pipeline is set up only once per video session.
-      // The keyframe-forcer may trigger resubscribe → user-published fires again;
-      // we must NOT create a second Decoder or open a second encoded stream.
       let broadwayActive = false;
+
+      // Reset broadwayActive when robot unpublishes so next user-published does full reinit.
+      rtcClient.on('user-unpublished', (user, mediaType) => {
+        log('[rtc] user-unpublished uid=' + user.uid + ' mediaType=' + mediaType);
+        if (mediaType === 'video') {
+          broadwayActive = false;
+          log('[broadway] reset broadwayActive=false — will reinit on next user-published');
+        }
+      });
 
       rtcClient.on('user-published', async (user, mediaType) => {
         if (mediaType === 'audio') {
@@ -745,10 +752,46 @@
             }
             prefeedSpropParams();
 
-            function processH264Payload(ts, payload) {
+            function processH264Payload(ts, payload, frameType) {
               if (!payload || payload.length === 0) return;
-              const nalType = payload[0] & 0x1F;
               bwPacketCount++;
+
+              // ── Path A: assembled video frame from RTCEncodedVideoFrame ─────────
+              // When H264/PT=0 reaches video receiver (via SSRC=40000 routing),
+              // Firefox assembles RTP→H264 and delivers complete frames to the transform.
+              // Data may be Annex-B (00 00 00 01 prefix) or AVCC (4-byte length prefix).
+              // Just feed directly to Broadway — no FU-A reassembly needed.
+              if (frameType === 'key' || frameType === 'delta') {
+                if (!bwHasIDR && frameType === 'key') {
+                  bwHasIDR = true;
+                  log('[broadway] ✓ video key-frame (IDR) at pkt#' + bwPacketCount + ' sz=' + payload.length);
+                }
+                // Detect format and decode
+                if (payload[0] === 0 && payload[1] === 0 && payload[2] === 0 && payload[3] === 1) {
+                  // Annex-B 4-byte start code — feed directly
+                  try { bwDecoder.decode(payload); } catch(_) {}
+                } else if (payload[0] === 0 && payload[1] === 0 && payload[2] === 1) {
+                  // Annex-B 3-byte start code — prepend 0x00
+                  const ab = new Uint8Array(payload.length + 1);
+                  ab[0] = 0; ab.set(payload, 1);
+                  try { bwDecoder.decode(ab); } catch(_) {}
+                } else {
+                  // Assume AVCC: [4-byte length][NAL data]+
+                  let off = 0;
+                  while (off + 4 <= payload.length) {
+                    const len = (payload[off]<<24)|(payload[off+1]<<16)|(payload[off+2]<<8)|payload[off+3];
+                    off += 4;
+                    if (len > 0 && off + len <= payload.length) feedNAL(payload.subarray(off, off + len));
+                    off += len;
+                  }
+                }
+                return;
+              }
+
+              // ── Path B: raw RTP payload from RTCEncodedAudioFrame ───────────────
+              // H264/PT=0 arrives on audio receiver as raw RTP payload.
+              // Need FU-A/STAP-A reassembly.
+              const nalType = payload[0] & 0x1F;
 
               // IDR / SPS / PPS arrival — log every time (not just once)
               if (nalType === 5 || nalType === 7 || nalType === 8) {
@@ -866,7 +909,12 @@
                         self.postMessage(label + ' hex-dump pkt#' + n + ' [' + hexDump + ']');
                       }
                       const payload = new Uint8Array(value.data).slice();
-                      self.postMessage({ts: ts, seq: seq, data: payload}, [payload.buffer]);
+                      // value.type is defined for RTCEncodedVideoFrame ('key'/'delta'),
+                      // undefined for RTCEncodedAudioFrame. Pass frameType so main thread
+                      // can use the correct decode path (video=assembled Annex-B/AVCC,
+                      // audio=raw RTP payload requiring FU-A reassembly).
+                      const frameType = (value.type !== undefined) ? value.type : 'audio';
+                      self.postMessage({ts, seq, data: payload, frameType}, [payload.buffer]);
                       wr.write(value).then(pump).catch(() => pump());
                     }).catch(e => self.postMessage(label + ' xform-err ' + e));
                   })();
@@ -883,7 +931,7 @@
                   w.onmessage = ({data}) => {
                     if (typeof data === 'string') { log('[broadway] ' + data); return; }
                     if (data && data.ts !== undefined && data.data)
-                      processH264Payload(data.ts, new Uint8Array(data.data));
+                      processH264Payload(data.ts, new Uint8Array(data.data), data.frameType || 'audio');
                   };
                   recv.transform = new RTCRtpScriptTransform(w);
                   log('[broadway] RTCRtpScriptTransform installed on ' + label);
@@ -902,33 +950,21 @@
                 log('[broadway] IDR recovery #' + idrRetries +
                   ': pkts=' + bwPacketCount + ' hasIDR=' + bwHasIDR);
                 if (idrRetries > MAX_IDR_RETRIES) {
-                  log('[broadway] IDR recovery: gave up after ' + MAX_IDR_RETRIES + ' retries — check robot stream');
+                  log('[broadway] gave up — no IDR after ' + MAX_IDR_RETRIES + ' attempts');
                   return;
                 }
-                // Attempt: RTCP PLI via requestKeyFrame() (Firefox WebRTC-extensions)
+                // RTCP PLI via requestKeyFrame() on all receivers
                 _allRecvs.forEach((recv, i) => {
                   if (recv && typeof recv.requestKeyFrame === 'function') {
-                    try { recv.requestKeyFrame(); log('[broadway] requestKeyFrame() sent on recv#' + i); }
+                    try { recv.requestKeyFrame(); log('[broadway] requestKeyFrame() on recv#' + i); }
                     catch(e) { log('[broadway] requestKeyFrame() err recv#' + i + ': ' + e.message); }
+                  } else {
+                    log('[broadway] requestKeyFrame() N/A on recv#' + i + ' (' + (recv.track&&recv.track.kind) + ')');
                   }
                 });
-                // Attempt 2+: force unsubscribe+subscribe → robot restarts stream fresh
-                if (idrRetries >= 2) {
-                  log('[broadway] IDR recovery: forcing resubscription for new SPS+PPS+IDR burst...');
-                  fuBuf = null; bwHasIDR = false; bwPacketCount = 0;
-                  _seenNalTypes = {};
-                  (async () => {
-                    try {
-                      await rtcClient.unsubscribe(user);
-                      await new Promise(r => setTimeout(r, 600));
-                      await rtcClient.subscribe(user, 'video');
-                      prefeedSpropParams();
-                      log('[broadway] IDR recovery: resubscribed → expect SPS+PPS+IDR');
-                    } catch(e) {
-                      log('[broadway] IDR recovery resubscribe failed: ' + e.message);
-                    }
-                  })();
-                }
+                // NOTE: No unsubscribe+subscribe here — it was causing sessions to break.
+                // If robot doesn't respond to PLI, user-unpublished+user-published will
+                // eventually trigger a fresh stream with new SPS+PPS+IDR.
               }
               // Schedule IDR check: 2s after transform install, retry every 8s (max MAX_IDR_RETRIES times)
               setTimeout(function checkIDR() {
@@ -972,23 +1008,17 @@
                 ' err=' + (v.error ? v.error.code : 'null') +
                 ' srcObj=tracks=' + tracks.length +
                 (trk ? (' trk.state=' + trk.readyState + ' trk.muted=' + muted) : ''));
-            // If track is muted (robot not sending), re-send askVersion and re-subscribe
+            // If track is muted (robot not sending), just re-send askVersion via RTM.
+            // Do NOT unsubscribe+subscribe — it breaks sessions and causes robot to disconnect.
+            // The user-unpublished event will fire when robot truly stops, and will reset
+            // broadwayActive=false so the next user-published does a full fresh reinit.
             if (muted === true) {
-              log('[video] trk.muted → re-sending askVersion + re-subscribing in 3s');
+              log('[video] trk.muted → re-sending askVersion via RTM (no resubscribe)');
               setTimeout(async () => {
                 try {
-                  if (window._rtmSendAskVer) { await window._rtmSendAskVer(); log('RTM askVersion re-sent (muted retry)'); }
-                } catch(e) { log('[!] muted retry askVersion failed: ' + e.message); }
-                try {
-                  await rtcClient.unsubscribe(user);
-                  log('[video] unsubscribed for muted retry');
-                  await new Promise(r => setTimeout(r, 1000));
-                  broadwayActive = false;  // allow re-init
-                  // user-published will fire again after unsubscribe+resubscribe
-                  await rtcClient.subscribe(user, 'video');
-                  log('[video] re-subscribed (muted retry)');
-                } catch(e) { log('[!] muted retry re-subscribe failed: ' + e.message); }
-              }, 3000);
+                  if (window._rtmSendAskVer) { await window._rtmSendAskVer(); log('RTM askVersion re-sent (muted)'); }
+                } catch(e) { log('[!] muted askVersion failed: ' + e.message); }
+              }, 2000);
             }
           } else {
             log('[video-dbg] no <video> in container');
