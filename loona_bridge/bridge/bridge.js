@@ -298,6 +298,73 @@ function findSdkFile(pkgName, candidates) {
 
   const page = await context.newPage();
 
+  // ── Track C: H265 → JPEG via Node.js ffmpeg ──────────────────────────────────
+  // WebCodecs VideoDecoder doesn't support H265 on Linux ARM64 without VA-API.
+  // GStreamer avdec_h265 may not be available in the HA base image.
+  // This fallback decodes H265 Annex B in Node.js (ffmpeg subprocess) and injects
+  // JPEG frames back into the page, which sends them to the Python HA Core socket.
+  //
+  // Flow: bridge.html RTCRtpScriptTransform → reassemble FU/AP → Annex B →
+  //       window.__h265FeedNAL(base64) → [IPC] → bridge.js → ffmpeg stdin →
+  //       ffmpeg stdout JPEG → page.evaluate(window.__nodeJpegReady) → ws.send
+  const cp = require('child_process');
+  let ffH265 = null, ffBuf = Buffer.alloc(0);
+
+  function startFfmpeg() {
+    if (ffH265) return;
+    ffH265 = cp.spawn('ffmpeg', [
+      '-loglevel', 'error',
+      '-f', 'hevc',        // raw H265 Annex B stream from stdin
+      '-i', 'pipe:0',
+      '-f', 'image2pipe',  // stream of individual image frames
+      '-vcodec', 'mjpeg',  // JPEG output
+      '-q:v', '4',         // quality 1–31, lower=better (4 ≈ 85%)
+      '-an',               // no audio
+      'pipe:1',
+    ], { stdio: ['pipe', 'pipe', 'inherit'] });
+
+    ffH265.stdin.on('error', () => {});
+    ffH265.on('error', (e) => console.error('[ffmpeg] ' + e.message));
+    ffH265.on('exit', (code) => {
+      console.error('[ffmpeg] exited code=' + code + ' — will restart on next NAL');
+      ffH265 = null;
+    });
+
+    ffH265.stdout.on('data', (chunk) => {
+      ffBuf = Buffer.concat([ffBuf, chunk]);
+      // Scan for complete JPEG frames: SOI=0xFF 0xD8 ... EOI=0xFF 0xD9
+      while (true) {
+        let soi = -1;
+        for (let i = 0; i + 1 < ffBuf.length; i++) {
+          if (ffBuf[i] === 0xFF && ffBuf[i + 1] === 0xD8) { soi = i; break; }
+        }
+        if (soi < 0) { ffBuf = Buffer.alloc(0); break; }
+        let eoi = -1;
+        for (let i = soi + 2; i + 1 < ffBuf.length; i++) {
+          if (ffBuf[i] === 0xFF && ffBuf[i + 1] === 0xD9) { eoi = i; break; }
+        }
+        if (eoi < 0) { if (soi > 0) ffBuf = ffBuf.slice(soi); break; }
+        const jpeg = ffBuf.slice(soi, eoi + 2);
+        ffBuf = ffBuf.slice(eoi + 2);
+        // Inject JPEG into page → window.__nodeJpegReady → ws.send to Python
+        page.evaluate((b64) => {
+          if (typeof window.__nodeJpegReady === 'function') window.__nodeJpegReady(b64);
+        }, jpeg.toString('base64')).catch(() => {});
+      }
+    });
+
+    console.error('[ffmpeg] H265 decoder started pid=' + ffH265.pid);
+  }
+
+  // Exposed to bridge.html: receives base64-encoded H265 Annex B NAL unit.
+  // Fire-and-forget — no return value needed.
+  await page.exposeFunction('__h265FeedNAL', (b64) => {
+    if (!ffH265) startFfmpeg();
+    if (ffH265 && !ffH265.stdin.destroyed) {
+      try { ffH265.stdin.write(Buffer.from(b64, 'base64')); } catch (_) {}
+    }
+  });
+
   // No timeout — startAgora runs indefinitely.
   page.setDefaultTimeout(0);
   page.setDefaultNavigationTimeout(0);

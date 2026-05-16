@@ -18,6 +18,7 @@ RUN apt-get update \
         npm \
         gstreamer1.0-libav \
         gstreamer1.0-plugins-bad \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/loona-bridge

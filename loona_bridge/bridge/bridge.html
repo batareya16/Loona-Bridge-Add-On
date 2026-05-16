@@ -414,6 +414,30 @@
       //   row: Python likely restarted on a NEW port — signal [FATAL] so bridge.js exits
       //   and run.sh re-reads bridge-config.json with the updated ws_port.
       let ws;
+
+      // ── Track C: Node.js ffmpeg JPEG injection hook ───────────────────────────
+      // bridge.js calls window.__nodeJpegReady(base64JPEG) when ffmpeg produces a
+      // decoded JPEG frame from the H265 Annex B stream fed via __h265FeedNAL.
+      window.__nodeJpegReady = (b64) => {
+        capturedFrames++;
+        if (!firstFrameLogged) {
+          firstFrameLogged = true;
+          log('[h265] ✓ FIRST FRAME — Node.js ffmpeg decode');
+        }
+        if (ws && ws.readyState === 1) {
+          const now = Date.now();
+          if (now - lastSendTs >= minInterval) {
+            lastSendTs = now;
+            try {
+              const raw = atob(b64);
+              const u8  = new Uint8Array(raw.length);
+              for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
+              ws.send(u8.buffer);
+            } catch(e) { log('[h265] nodeJpeg send err: ' + e.message); }
+          }
+        }
+      };
+
       let _wsResolve;
       const wsFirstOpen = new Promise((res) => { _wsResolve = res; });
       let wsEverOpened        = false;
@@ -720,23 +744,39 @@
             let h265FUBuf     = null; // Array<Uint8Array>: current FU fragments
             let h265FUType    = 0;   // nal_unit_type of FU being reassembled
 
-            // Build Annex B chunk: [params?][0001][NAL] and feed VideoDecoder.
+            // Build Annex B chunk: [params?][0001][NAL] and decode.
+            // Track C (Node.js ffmpeg) is primary; VideoDecoder is fallback.
             function feedH265(nal, isIDR, ts) {
+              // Build Annex B: for IDR prepend VPS/SPS/PPS so decoder can init.
+              const nalList = (isIDR && h265ParamSets.length > 0)
+                ? [...h265ParamSets, nal]
+                : [nal];
+              let totalLen = 0;
+              nalList.forEach(n => { totalLen += 4 + n.length; });
+              const annexB = new Uint8Array(totalLen);
+              let off = 0;
+              nalList.forEach(n => {
+                annexB[off]=0; annexB[off+1]=0; annexB[off+2]=0; annexB[off+3]=1; off+=4;
+                annexB.set(n, off); off += n.length;
+              });
+
+              // ── Track C: Node.js ffmpeg (primary on ARM64 Linux) ─────────────
+              // bridge.js exposes __h265FeedNAL via page.exposeFunction.
+              // Data is base64-encoded to avoid Uint8Array serialization issues.
+              if (typeof window.__h265FeedNAL === 'function') {
+                try {
+                  // Chunked String.fromCharCode avoids call-stack overflow on large frames
+                  const SZ = 0x8000; let s = '';
+                  for (let i = 0; i < annexB.length; i += SZ)
+                    s += String.fromCharCode.apply(null, annexB.subarray(i, i + SZ));
+                  window.__h265FeedNAL(btoa(s));
+                } catch(e) { log('[h265] feedNAL b64 err: ' + e.message); }
+                return; // Node.js path is primary
+              }
+
+              // ── Fallback: WebCodecs VideoDecoder ─────────────────────────────
               if (!videoDecoder || videoDecoder.state !== 'configured') return;
               try {
-                // For key frames prepend current parameter sets so decoder can
-                // (re-)initialise without a separate config chunk.
-                const nalList = (isIDR && h265ParamSets.length > 0)
-                  ? [...h265ParamSets, nal]
-                  : [nal];
-                let totalLen = 0;
-                nalList.forEach(n => { totalLen += 4 + n.length; });
-                const annexB = new Uint8Array(totalLen);
-                let off = 0;
-                nalList.forEach(n => {
-                  annexB[off]=0; annexB[off+1]=0; annexB[off+2]=0; annexB[off+3]=1; off+=4;
-                  annexB.set(n, off); off += n.length;
-                });
                 videoDecoder.decode(new EncodedVideoChunk({
                   type: isIDR ? 'key' : 'delta',
                   timestamp: ts || 0,
@@ -814,7 +854,23 @@
                   if (newParams.length > 0) {
                     h265ParamSets = newParams;
                     log('[h265] param sets stored (' + h265ParamSets.length + ' NALs)');
-                    // Feed param sets so decoder is ready before first IDR arrives
+                    // Feed param sets to Node.js ffmpeg pipeline (Track C)
+                    if (typeof window.__h265FeedNAL === 'function') {
+                      let pLen = 0;
+                      newParams.forEach(n => { pLen += 4 + n.length; });
+                      const pAB = new Uint8Array(pLen); let pOff = 0;
+                      newParams.forEach(n => {
+                        pAB[pOff]=0; pAB[pOff+1]=0; pAB[pOff+2]=0; pAB[pOff+3]=1; pOff+=4;
+                        pAB.set(n, pOff); pOff += n.length;
+                      });
+                      try {
+                        const SZ = 0x8000; let s = '';
+                        for (let i = 0; i < pAB.length; i += SZ)
+                          s += String.fromCharCode.apply(null, pAB.subarray(i, i + SZ));
+                        window.__h265FeedNAL(btoa(s));
+                      } catch(_) {}
+                    }
+                    // Feed param sets to VideoDecoder (Track B fallback)
                     if (videoDecoder && videoDecoder.state === 'configured') {
                       newParams.forEach(n => {
                         try {
