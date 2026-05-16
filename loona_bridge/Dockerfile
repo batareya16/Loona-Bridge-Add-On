@@ -16,6 +16,8 @@ RUN apt-get update \
         jq \
         nodejs \
         npm \
+        gstreamer1.0-libav \
+        gstreamer1.0-plugins-bad \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/loona-bridge

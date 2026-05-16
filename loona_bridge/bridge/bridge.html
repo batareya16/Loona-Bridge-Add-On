@@ -538,7 +538,11 @@
       // With codec='h265' and Firefox 130+ (media.peerconnection.video.h265_enabled=true),
       // Agora negotiates H265 in the video SDP → robot routes H265 to video receiver →
       // Firefox decodes natively via GStreamer avdec_h265 → canvas capture via tick().
-      const rtcCodec = cfg.codec || 'h265';
+      // Hardcoded 'h265': Loona robot always sends H265/HEVC.
+      // cfg.codec is set to 'h264' by the Python bridge but must be ignored here —
+      // telling Agora to negotiate H265 causes the edge server to route the robot's
+      // H265 stream to the video m-section where Firefox 130+GStreamer can decode it.
+      const rtcCodec = 'h265';
       const rtcClient = AgoraRTC.createClient({mode: rtcMode, codec: rtcCodec, role: rtcRole});
       log('[rtc-codec] using codec=' + rtcCodec + ' mode=' + rtcMode + ' role=' + rtcRole);
 
@@ -600,107 +604,166 @@
       }
       const findBestPC = (obj) => findPC(obj, 0, true) || findPC(obj, 0, false);
 
-      // ── Broadway H264 software decoder ──────────────────────────────────────
-      // Called from audio-published handler (primary: robot sends H264/PT=0 via
-      // PCMU slot; skipping audio subscribe keeps routing to audio receiver)
-      // and from video-published handler (fallback).
+      // ── H265 decode pipeline (Track B: WebCodecs) + H264 Broadway fallback ──
+      // Primary: WebCodecs VideoDecoder — Firefox 130 supports HEVC if GStreamer
+      //   avdec_h265 is present (Track A installs gstreamer1.0-libav).
+      //   RTCRtpScriptTransform intercepts raw RTP payloads on ALL receivers,
+      //   reassembles H265 FU/AP → Annex B → feeds VideoDecoder.
+      //   Falls back to Broadway if stream turns out to be H264.
       // broadwayActive guard (set by callers) prevents double-install per session.
       function installBroadway() {
         (function attemptInstall(retries) {
           try {
-            // Check PC first — Agora may need a moment to set up receivers
             const pc = findBestPC(rtcClient);
             if (!pc) {
-              log('[broadway] no PC yet (attempt ' + (retries+1) + ')');
+              log('[h265] no PC yet (attempt ' + (retries+1) + ')');
               if (retries < 12) setTimeout(() => attemptInstall(retries + 1), 1000);
-              else log('[broadway] gave up waiting for PC');
+              else log('[h265] gave up waiting for PC');
               return;
             }
             const receivers = pc.getReceivers();
             if (receivers.length === 0) {
-              log('[broadway] 0 receivers (attempt ' + (retries+1) + ')');
+              log('[h265] 0 receivers (attempt ' + (retries+1) + ')');
               if (retries < 12) setTimeout(() => attemptInstall(retries + 1), 1000);
-              else log('[broadway] gave up waiting for receivers');
+              else log('[h265] gave up waiting for receivers');
               return;
             }
 
-            if (typeof Decoder === 'undefined') {
-              log('[broadway] Decoder not available — broadway.js not loaded');
-              return;
+            // ── Track B: WebCodecs VideoDecoder (H265 software/HW decode) ────
+            // Asynchronously checked: initialised once isConfigSupported resolves.
+            let videoDecoder = null;
+            const wcCfg = { codec: 'hev1.1.6.L93.90', codedWidth: 1280, codedHeight: 720 };
+            if (typeof VideoDecoder !== 'undefined') {
+              VideoDecoder.isConfigSupported(wcCfg).then(sup => {
+                log('[h265] VideoDecoder H265 supported=' + sup.supported);
+                if (!sup.supported) return;
+                videoDecoder = new VideoDecoder({
+                  output: (frame) => {
+                    const w = frame.displayWidth, h = frame.displayHeight;
+                    if (grabCanvas.width  !== w) grabCanvas.width  = w;
+                    if (grabCanvas.height !== h) grabCanvas.height = h;
+                    grabCtx.drawImage(frame, 0, 0);
+                    frame.close();
+                    capturedFrames++;
+                    if (!firstFrameLogged) {
+                      firstFrameLogged = true;
+                      log('[h265] ✓ FIRST FRAME — ' + w + 'x' + h);
+                    }
+                    if (ws.readyState === 1) {
+                      const now = Date.now();
+                      if (now - lastSendTs >= minInterval) {
+                        lastSendTs = now;
+                        grabCanvas.toBlob((blob) => {
+                          if (!blob) return;
+                          blob.arrayBuffer().then((ab) => {
+                            if (ws.readyState === 1) ws.send(ab);
+                          });
+                        }, 'image/jpeg', QUALITY);
+                      }
+                    }
+                  },
+                  error: (e) => log('[h265] VideoDecoder error: ' + e),
+                });
+                videoDecoder.configure(wcCfg);
+                log('[h265] ✓ VideoDecoder configured');
+              }).catch(e => log('[h265] isConfigSupported error: ' + e.message));
+            } else {
+              log('[h265] VideoDecoder API not available');
             }
 
-            const bwDecoder = new Decoder({ rgb: true });
+            // ── Broadway H264 fallback ────────────────────────────────────────
+            let bwDecoder = null;
+            if (typeof Decoder !== 'undefined') {
+              bwDecoder = new Decoder({ rgb: true });
+              bwDecoder.onDecoderReady = () => log('[broadway] ✓ H264 fallback decoder ready');
+              bwDecoder.onPictureDecoded = (buffer, width, height) => {
+                if (grabCanvas.width  !== width)  grabCanvas.width  = width;
+                if (grabCanvas.height !== height) grabCanvas.height = height;
+                const imgData = grabCtx.createImageData(width, height);
+                imgData.data.set(buffer);
+                grabCtx.putImageData(imgData, 0, 0);
+                capturedFrames++;
+                if (!firstFrameLogged) {
+                  firstFrameLogged = true;
+                  log('[broadway] ✓ FIRST H264 FRAME — ' + width + 'x' + height);
+                }
+                if (ws.readyState === 1) {
+                  const now = Date.now();
+                  if (now - lastSendTs >= minInterval) {
+                    lastSendTs = now;
+                    grabCanvas.toBlob((blob) => {
+                      if (!blob) return;
+                      blob.arrayBuffer().then((ab) => {
+                        if (ws.readyState === 1) ws.send(ab);
+                      });
+                    }, 'image/jpeg', QUALITY);
+                  }
+                }
+              };
+              // Pre-feed H264 SPS+PPS from sprop-parameter-sets if available
+              if (window._spropSPS) {
+                try { bwDecoder.decode(Uint8Array.from(atob(window._spropSPS), c => c.charCodeAt(0))); log('[broadway] pre-fed SPS'); } catch(_) {}
+              }
+              if (window._spropPPS) {
+                try { bwDecoder.decode(Uint8Array.from(atob(window._spropPPS), c => c.charCodeAt(0))); log('[broadway] pre-fed PPS'); } catch(_) {}
+              }
+            } else {
+              log('[h265] Broadway Decoder not available');
+            }
+
             let bwHasIDR = false, idrRetries = 0, totalPktCount = 0;
 
-            bwDecoder.onDecoderReady = function() {
-              log('[broadway] ✓ WASM decoder ready');
-            };
+            // ── H265 RTP state (shared across all receivers; robot sends one stream) ──
+            // AP (nal_unit_type=48): carries VPS/SPS/PPS — update param sets.
+            // FU (nal_unit_type=49): fragment reassembler state.
+            let h265ParamSets = [];  // Array<Uint8Array>: latest VPS/SPS/PPS NALs
+            let h265FUBuf     = null; // Array<Uint8Array>: current FU fragments
+            let h265FUType    = 0;   // nal_unit_type of FU being reassembled
 
-            bwDecoder.onPictureDecoded = function(buffer, width, height) {
-              if (grabCanvas.width  !== width)  grabCanvas.width  = width;
-              if (grabCanvas.height !== height) grabCanvas.height = height;
-              const imageData = grabCtx.createImageData(width, height);
-              imageData.data.set(buffer);
-              grabCtx.putImageData(imageData, 0, 0);
-              capturedFrames++;
-              if (!firstFrameLogged) {
-                firstFrameLogged = true;
-                log('[broadway] ✓ FIRST FRAME DECODED — ' + width + 'x' + height);
-              }
-              if (ws.readyState === 1) {
-                const now = Date.now();
-                if (now - lastSendTs >= minInterval) {
-                  lastSendTs = now;
-                  grabCanvas.toBlob((blob) => {
-                    if (!blob) return;
-                    blob.arrayBuffer().then((ab) => {
-                      if (ws.readyState === 1) ws.send(ab);
-                    });
-                  }, 'image/jpeg', QUALITY);
-                }
-              }
-            };
-
-            // Pre-feed SPS+PPS from sprop-parameter-sets (set by setRemoteDescription patch)
-            if (window._spropSPS) {
+            // Build Annex B chunk: [params?][0001][NAL] and feed VideoDecoder.
+            function feedH265(nal, isIDR, ts) {
+              if (!videoDecoder || videoDecoder.state !== 'configured') return;
               try {
-                const sps = Uint8Array.from(atob(window._spropSPS), c => c.charCodeAt(0));
-                bwDecoder.decode(sps);
-                log('[broadway] pre-fed SPS (' + sps.length + ' B)');
-              } catch (e) { log('[broadway] SPS pre-feed err: ' + e.message); }
+                // For key frames prepend current parameter sets so decoder can
+                // (re-)initialise without a separate config chunk.
+                const nalList = (isIDR && h265ParamSets.length > 0)
+                  ? [...h265ParamSets, nal]
+                  : [nal];
+                let totalLen = 0;
+                nalList.forEach(n => { totalLen += 4 + n.length; });
+                const annexB = new Uint8Array(totalLen);
+                let off = 0;
+                nalList.forEach(n => {
+                  annexB[off]=0; annexB[off+1]=0; annexB[off+2]=0; annexB[off+3]=1; off+=4;
+                  annexB.set(n, off); off += n.length;
+                });
+                videoDecoder.decode(new EncodedVideoChunk({
+                  type: isIDR ? 'key' : 'delta',
+                  timestamp: ts || 0,
+                  data: annexB,
+                }));
+              } catch(e) { log('[h265] decode error: ' + e.message); }
             }
-            if (window._spropPPS) {
-              try {
-                const pps = Uint8Array.from(atob(window._spropPPS), c => c.charCodeAt(0));
-                bwDecoder.decode(pps);
-                log('[broadway] pre-fed PPS (' + pps.length + ' B)');
-              } catch (e) { log('[broadway] PPS pre-feed err: ' + e.message); }
-            }
-            if (!window._spropSPS)
-              log('[broadway] no sprop-parameter-sets — waiting for in-band SPS/PPS');
 
-            // ── RTCRtpScriptTransform worker ─────────────────────────────────
-            // Pipes frames through readable→writable (avoids back-pressure stall)
-            // and posts each frame's encoded payload + metadata to main thread.
-            // chunk.data is the encoded payload AFTER RTP depacketization — for
-            // an audio receiver carrying PT=0/H264 this is the raw H264 payload
-            // (FU-A fragment, STAP-A, or single NAL unit).
+            // ── RTCRtpScriptTransform worker ──────────────────────────────────
+            // Runs in a Worker so it doesn't block the main thread.
+            // Detects H264 vs H265 for IDR tagging; posts raw payload to main.
             const workerSrc = [
               'self.onrtctransform = function(ev) {',
               '  var tf = ev.transformer;',
               '  tf.readable.pipeThrough(new TransformStream({',
               '    transform: function(chunk, ctrl) {',
               '      try {',
-              '        var m  = chunk.getMetadata ? chunk.getMetadata() : {};',
+              '        var m   = chunk.getMetadata ? chunk.getMetadata() : {};',
               '        var raw = chunk.data;',
-              '        var u8 = new Uint8Array(raw instanceof ArrayBuffer ? raw.slice(0) : raw);',
+              '        var u8  = new Uint8Array(raw instanceof ArrayBuffer ? raw.slice(0) : raw);',
               '        var nt  = u8.length > 0 ? (u8[0] & 0x1f) : -1;',
               '        var nt5 = u8.length > 0 ? ((u8[0] >> 1) & 0x3f) : -1;',
               '        var ft  = "P";',
-              '        if (nt===5) ft="IDR";', // H264 single IDR NAL
-              '        if (nt===28 && u8.length>1 && (u8[1]&0x80) && (u8[1]&0x1f)===5) ft="IDR";', // H264 FU-A IDR
-              '        if (nt5===48) ft="IDR";', // H265 AP (contains VPS/SPS/PPS — key material)
-              '        if (nt5===49 && u8.length>2 && (u8[2]&0x80) && ((u8[2]&0x1f)===19||(u8[2]&0x1f)===20)) ft="IDR";', // H265 FU IDR_W_RADL/IDR_N_LP
+              '        if (nt===5) ft="IDR";',
+              '        if (nt===28 && u8.length>1 && (u8[1]&0x80) && (u8[1]&0x1f)===5) ft="IDR";',
+              '        if (nt5===48) ft="IDR";',
+              '        if (nt5===49 && u8.length>2 && (u8[2]&0x80) && ((u8[2]&0x1f)===19||(u8[2]&0x1f)===20)) ft="IDR";',
               '        self.postMessage({ data: u8, ts: chunk.timestamp||0, seq: m.sequenceNumber||0, ft: ft }, [u8.buffer]);',
               '      } catch(_) {}',
               '      ctrl.enqueue(chunk);',
@@ -711,109 +774,139 @@
             const workerBlob = new Blob([workerSrc], { type: 'application/javascript' });
             const workerUrl  = URL.createObjectURL(workerBlob);
 
-            log('[broadway] found PC, receivers=' + receivers.length);
+            log('[h265] found PC, receivers=' + receivers.length);
 
-            // ── Per-receiver transform + FU-A reassembler ────────────────────
-            // Each receiver gets its own worker and independent reassembler state
-            // so fragments from audio and video receivers never get mixed.
             receivers.forEach((recv, idx) => {
               const kind = recv.track ? recv.track.kind : '?';
-              log('[broadway] recv#' + idx + ' kind=' + kind +
+              log('[h265] recv#' + idx + ' kind=' + kind +
                   (recv.track ? ' state=' + recv.track.readyState + ' muted=' + recv.track.muted : ''));
 
-              // Per-receiver state
-              let fuBuf = null, fuNalLocal = 0, recvPktCount = 0;
+              // Per-receiver H264 reassembler (Broadway fallback)
+              let fuBuf264 = null, fuNalLocal264 = 0, recvPktCount = 0;
 
-              function processPayload(payload) {
+              function processPayload(payload, ts) {
                 recvPktCount++;
                 totalPktCount++;
                 const pktNum = totalPktCount;
                 if (!payload || payload.length < 1) return;
 
-                // ── H265 detection (RFC 7798) ────────────────────────────────
-                // H265 nal_unit_type = (byte0 >> 1) & 0x3f
-                // AP=48 (0x60): aggregation packet — carries VPS/SPS/PPS
-                // FU=49 (0x62): fragmentation unit — carries large slices
-                // Broadway.js is H264-only and cannot decode H265.
-                // Firefox decodes H265 natively; canvas capture via tick() handles it.
+                // ── H265 detection (RFC 7798) ─────────────────────────────────
+                // H265 NAL unit type = (byte0 >> 1) & 0x3f
+                // AP=48: aggregation packet (VPS/SPS/PPS)
+                // FU=49: fragmentation unit (IDR/CRA slices)
                 const nt265 = (payload[0] >> 1) & 0x3f;
+
                 if (nt265 === 48) {
-                  // H265 AP: treat as key material → stop IDR retry timer
+                  // AP packet: [2B PayloadHdr][2B NALU_size][NALU data]+
+                  // Extract each NAL unit (VPS=32, SPS=33, PPS=34) as param sets.
                   bwHasIDR = true;
-                  if (pktNum <= 10)
-                    log('[broadway] recv#' + idx + ' pkt#' + pktNum +
-                        ' H265-AP (VPS/SPS/PPS) ' + payload.length + 'B — Firefox native decode');
+                  if (pktNum <= 20 || pktNum % 300 === 0)
+                    log('[h265] recv#' + idx + ' pkt#' + pktNum + ' H265-AP ' + payload.length + 'B');
+                  let off = 2, newParams = [];
+                  while (off + 2 <= payload.length) {
+                    const sz = (payload[off] << 8) | payload[off+1]; off += 2;
+                    if (off + sz > payload.length) break;
+                    const nal = payload.slice(off, off + sz); off += sz;
+                    const nalType = (nal[0] >> 1) & 0x3f;
+                    if (pktNum <= 20) log('[h265] AP nal nalType=' + nalType + ' ' + sz + 'B');
+                    newParams.push(nal);
+                  }
+                  if (newParams.length > 0) {
+                    h265ParamSets = newParams;
+                    log('[h265] param sets stored (' + h265ParamSets.length + ' NALs)');
+                    // Feed param sets so decoder is ready before first IDR arrives
+                    if (videoDecoder && videoDecoder.state === 'configured') {
+                      newParams.forEach(n => {
+                        try {
+                          const a = new Uint8Array(4 + n.length);
+                          a[0]=0; a[1]=0; a[2]=0; a[3]=1; a.set(n, 4);
+                          videoDecoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data: a }));
+                        } catch(_) {}
+                      });
+                    }
+                  }
                   return;
                 }
+
                 if (nt265 === 49) {
-                  // H265 FU: fur_type in byte2 bits[4:0]
+                  // FU packet: [2B PayloadHdr][1B FU-hdr][payload]
+                  // FU-hdr: S(bit7) E(bit6) FuType(bits5:0)
+                  // Reconstructed NAL hdr: byte0=(PayloadHdr[0]&0x81)|(FuType<<1), byte1=PayloadHdr[1]
                   if (payload.length < 3) return;
-                  const fuHdr265  = payload[2];
-                  const startBit  = (fuHdr265 & 0x80) !== 0;
-                  const furType   = fuHdr265 & 0x1f;
-                  const isIDR265  = (furType === 19 || furType === 20); // IDR_W_RADL / IDR_N_LP
-                  if (isIDR265 && startBit) bwHasIDR = true;
-                  if (pktNum <= 10 || pktNum % 300 === 0)
-                    log('[broadway] recv#' + idx + ' pkt#' + pktNum +
-                        ' H265-FU fur=' + furType + (isIDR265 ? '(IDR)' : '') +
-                        ' start=' + startBit + ' ' + payload.length + 'B — Firefox native decode');
+                  const payHdr0 = payload[0], payHdr1 = payload[1];
+                  const fuHdr   = payload[2];
+                  const startBit = (fuHdr & 0x80) !== 0;
+                  const endBit   = (fuHdr & 0x40) !== 0;
+                  const fuType   = fuHdr & 0x3f;
+                  const isIDR    = (fuType === 19 || fuType === 20); // IDR_W_RADL / IDR_N_LP
+                  if (isIDR && startBit) bwHasIDR = true;
+
+                  if (startBit) {
+                    h265FUType = fuType;
+                    const nalHdr0 = (payHdr0 & 0x81) | (fuType << 1);
+                    h265FUBuf = [new Uint8Array([nalHdr0, payHdr1]), payload.slice(3)];
+                  } else if (h265FUBuf) {
+                    h265FUBuf.push(payload.slice(3));
+                  }
+
+                  if (endBit && h265FUBuf) {
+                    const totalLen = h265FUBuf.reduce((a, b) => a + b.length, 0);
+                    const nal = new Uint8Array(totalLen);
+                    let off = 0;
+                    h265FUBuf.forEach(c => { nal.set(c, off); off += c.length; });
+                    h265FUBuf = null;
+                    if (pktNum <= 20 || pktNum % 300 === 0)
+                      log('[h265] FU fuType=' + fuType + (isIDR ? '(IDR)' : '') + ' ' + nal.length + 'B');
+                    feedH265(nal, isIDR, ts);
+                  }
                   return;
                 }
 
-                // ── H264 parsing below ───────────────────────────────────────
+                // ── H264 (Broadway fallback — in case stream is actually H264) ──
+                if (!bwDecoder) return;
                 const naluType = payload[0] & 0x1f;
-
                 if (naluType === 28) {
-                  // FU-A fragmentation unit
+                  // FU-A
                   const fuHdr    = payload[1];
                   const startBit = (fuHdr & 0x80) !== 0;
                   const endBit   = (fuHdr & 0x40) !== 0;
                   const innerNt  = fuHdr & 0x1f;
                   if (startBit) {
-                    fuNalLocal = innerNt;
-                    fuBuf = [new Uint8Array([(payload[0] & 0xe0) | innerNt]), payload.slice(2)];
-                  } else if (fuBuf) {
-                    fuBuf.push(payload.slice(2));
+                    fuNalLocal264 = innerNt;
+                    fuBuf264 = [new Uint8Array([(payload[0] & 0xe0) | innerNt]), payload.slice(2)];
+                  } else if (fuBuf264) {
+                    fuBuf264.push(payload.slice(2));
                   }
-                  if (endBit && fuBuf) {
-                    const totalLen = fuBuf.reduce((a, b) => a + b.length, 0);
+                  if (endBit && fuBuf264) {
+                    const totalLen = fuBuf264.reduce((a, b) => a + b.length, 0);
                     const nal = new Uint8Array(totalLen);
                     let off = 0;
-                    fuBuf.forEach(c => { nal.set(c, off); off += c.length; });
-                    fuBuf = null;
-                    if (fuNalLocal === 5) bwHasIDR = true;
-                    if (!bwHasIDR) return;
-                    if (pktNum <= 10 || pktNum % 300 === 0)
-                      log('[broadway] recv#' + idx + ' pkt#' + pktNum + ' FU-A nal=' + fuNalLocal + ' ' + nal.length + 'B');
-                    bwDecoder.decode(nal);
-                  }
-                } else if (naluType === 24) {
-                  // STAP-A: multiple NAL units in one RTP packet
-                  let off = 1;
-                  while (off + 2 <= payload.length) {
-                    const size = (payload[off] << 8) | payload[off + 1];
-                    off += 2;
-                    if (off + size > payload.length) break;
-                    const nal = payload.slice(off, off + size);
-                    off += size;
-                    const nt = nal[0] & 0x1f;
-                    if (nt === 7 || nt === 8) {         // SPS / PPS
-                      bwDecoder.decode(nal);
-                      log('[broadway] STAP-A nal=' + nt + ' (SPS/PPS) ' + size + 'B');
-                    } else if (nt === 5) {               // IDR
-                      bwHasIDR = true;
-                      bwDecoder.decode(nal);
-                    } else if (bwHasIDR) {               // P/B after IDR
+                    fuBuf264.forEach(c => { nal.set(c, off); off += c.length; });
+                    fuBuf264 = null;
+                    if (fuNalLocal264 === 5) bwHasIDR = true;
+                    if (bwHasIDR) {
+                      if (pktNum <= 10 || pktNum % 300 === 0)
+                        log('[broadway] recv#' + idx + ' FU-A nal=' + fuNalLocal264 + ' ' + nal.length + 'B');
                       bwDecoder.decode(nal);
                     }
                   }
+                } else if (naluType === 24) {
+                  // STAP-A
+                  let off = 1;
+                  while (off + 2 <= payload.length) {
+                    const size = (payload[off] << 8) | payload[off+1]; off += 2;
+                    if (off + size > payload.length) break;
+                    const nal = payload.slice(off, off+size); off += size;
+                    const nt = nal[0] & 0x1f;
+                    if (nt === 7 || nt === 8) { bwDecoder.decode(nal); }
+                    else if (nt === 5) { bwHasIDR = true; bwDecoder.decode(nal); }
+                    else if (bwHasIDR) { bwDecoder.decode(nal); }
+                  }
                 } else {
-                  // Single NAL unit
-                  const isIDR = (naluType === 5);
-                  const isSPS = (naluType === 7);
-                  const isPPS = (naluType === 8);
-                  if (isIDR) bwHasIDR = true;
-                  if (isSPS || isPPS || isIDR || bwHasIDR) {
+                  // Single NAL
+                  const isIDR264 = (naluType === 5);
+                  if (isIDR264) bwHasIDR = true;
+                  if (naluType === 7 || naluType === 8 || isIDR264 || bwHasIDR) {
                     if (pktNum <= 10 || pktNum % 300 === 0)
                       log('[broadway] recv#' + idx + ' pkt#' + pktNum + ' nal=' + naluType + ' ' + payload.length + 'B');
                     bwDecoder.decode(payload);
@@ -825,39 +918,36 @@
                 try {
                   const worker = new Worker(workerUrl);
                   worker.onmessage = (e) => {
-                    const { data, ft } = e.data;
-                    // Hex dump first 10 packets for diagnosis
+                    const { data, ft, ts } = e.data;
                     if (totalPktCount < 10) {
                       const hex = Array.from(data.slice(0, 8))
                         .map(b => b.toString(16).padStart(2, '0')).join(' ');
-                      log('[broadway] recv#' + idx + ' len=' + data.length +
-                          ' nal=' + (data.length ? (data[0] & 0x1f) : '?') +
+                      log('[h265] recv#' + idx + ' len=' + data.length +
+                          ' nt5=' + (data.length ? (data[0]>>1)&0x3f : '?') +
                           ' type=' + ft + ' [' + hex + ']');
                     }
-                    processPayload(data);
+                    processPayload(data, ts);
                   };
-                  worker.onerror = (e) => log('[broadway] recv#' + idx + ' worker err: ' + e.message);
+                  worker.onerror = (e) => log('[h265] recv#' + idx + ' worker err: ' + e.message);
                   recv.transform = new RTCRtpScriptTransform(worker);
-                  log('[broadway] recv#' + idx + ' RTCRtpScriptTransform installed');
+                  log('[h265] recv#' + idx + ' RTCRtpScriptTransform installed');
                 } catch (e) {
-                  log('[broadway] recv#' + idx + ' transform err: ' + e.message);
+                  log('[h265] recv#' + idx + ' transform err: ' + e.message);
                 }
               } else {
-                log('[broadway] RTCRtpScriptTransform unavailable — no software decode path');
+                log('[h265] RTCRtpScriptTransform unavailable — no software decode path');
               }
             });
 
             // ── IDR recovery timer ────────────────────────────────────────────
-            // Polls every 5 s until first IDR arrives.
-            // Uses requestKeyFrame() on all receivers + periodic RTM askVersion.
             const idrTimer = setInterval(() => {
               if (bwHasIDR) {
                 clearInterval(idrTimer);
-                log('[broadway] IDR arrived — recovery timer cleared');
+                log('[h265] IDR/param-set arrived — recovery timer cleared');
                 return;
               }
               idrRetries++;
-              log('[broadway] no IDR yet (retry#' + idrRetries + ')');
+              log('[h265] no IDR yet (retry#' + idrRetries + ')');
               try {
                 pc.getReceivers().forEach(r => {
                   try { if (r.requestKeyFrame) r.requestKeyFrame(); } catch(_) {}
@@ -865,17 +955,19 @@
               } catch(_) {}
               if (idrRetries % 3 === 0 && window._rtmSendAskVer) {
                 window._rtmSendAskVer().catch(() => {});
-                log('[broadway] re-sent askVersion via RTM (IDR retry#' + idrRetries + ')');
+                log('[h265] re-sent askVersion via RTM (retry#' + idrRetries + ')');
               }
               if (idrRetries >= 30) {
                 clearInterval(idrTimer);
-                log('[broadway] IDR timeout after 30 retries — giving up');
+                log('[h265] IDR timeout after 30 retries — giving up');
               }
             }, 5000);
 
-            log('[broadway] setup complete — installed on ' + receivers.length + ' receiver(s)');
+            log('[h265] setup complete — ' + receivers.length + ' receiver(s),' +
+                ' VideoDecoder=' + (typeof VideoDecoder !== 'undefined') +
+                ' Broadway=' + !!bwDecoder);
           } catch (e) {
-            log('[broadway] fatal setup error: ' + e.message);
+            log('[h265] fatal setup error: ' + e.message);
           }
         })(0);
       }
@@ -886,7 +978,7 @@
         if (mediaType === 'video') {
           broadwayActive = false;
           videoSessionActive = false;
-          log('[broadway] reset broadwayActive+videoSessionActive=false — will reinit on next user-published');
+          log('[h265] reset broadwayActive+videoSessionActive=false — will reinit on next user-published');
         }
       });
 
@@ -897,7 +989,10 @@
           // v0.1.73: When audio is NOT subscribed, the robot ONLY fires user-published
           // for audio (H264/PT=0 via PCMU slot). video user-published never fires.
           // We must install Broadway directly from this audio handler.
-          log('[audio] skip subscription — needed to preserve H264/PT=0 routing to audio receiver');
+          // Skip audio subscription: subscribing triggers OPUS negotiation and
+          // may disrupt H265 routing. The pipeline (RTCRtpScriptTransform) is
+          // installed regardless so it captures H265 on whichever receiver gets it.
+          log('[audio] skip subscription — installing H265 decode pipeline immediately');
           if (!broadwayActive) {
             broadwayActive = true;
             // 400 ms delay: let Agora finish SDP exchange and create PC receivers
