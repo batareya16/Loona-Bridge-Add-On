@@ -347,13 +347,19 @@ function findSdkFile(pkgName, candidates) {
   // Signal-kills (code=null, from our own kill()) are NOT hw failures — don't disable hw.
   let useHwDec          = (process.arch === 'arm64');
   let ffNoOutputTimer   = null;
-  let ffFirstFrameSeen  = false;  // true after first JPEG output from current ffmpeg instance
+  let ffFirstFrameSeen  = false;  // true after first JPEG output from current decoder instance
+  // During pipeline startup (NULL→PLAYING) fdsrc does not read stdin.
+  // Writing every incoming frame would queue up 20-30 frames before the decoder
+  // starts — permanently behind by 2-3 s.  Fix: write ONLY the first IDR to stdin,
+  // drop all subsequent NALs until the first JPEG is produced.  Once the decoder
+  // is live (ffFirstFrameSeen) normal per-frame writing resumes.
+  let ffIdrWritten      = false;  // true after the startup IDR was sent to stdin
 
   // First frame can take 3-5 s (V4L2M2M init or software codec startup).
-  // After the first frame, 2 s silence = decode error → kill + wait for IDR.
+  // After the first frame, 3 s silence = decode error → kill + wait for IDR.
   function resetNoOutputTimer() {
     clearTimeout(ffNoOutputTimer);
-    const ms = ffFirstFrameSeen ? 2000 : 5000;
+    const ms = ffFirstFrameSeen ? 3000 : 5000;
     ffNoOutputTimer = setTimeout(() => {
       if (ffH265) {
         console.error('[ffmpeg] no JPEG output for ' + (ms / 1000) +
@@ -420,7 +426,8 @@ function findSdkFile(pkgName, candidates) {
 
   function startFfmpeg() {
     if (ffH265) return;
-    ffFirstFrameSeen = false;  // reset per-instance flag
+    ffFirstFrameSeen = false;  // reset per-instance flags
+    ffIdrWritten     = false;
     const args = buildFfArgs();
     if (useHwDec) {
       probeHwDevice();  // log available /dev/videoN for diagnostics
@@ -513,11 +520,22 @@ function findSdkFile(pkgName, candidates) {
       startFfmpeg();
     }
     if (ffH265 && !ffH265.stdin.destroyed) {
-      // Skip overrun check during GStreamer pipeline startup (NULL→PLAYING can take 1-3 s).
-      // fdsrc only starts reading once PLAYING is reached — before that the write buffer
-      // accumulates.  After the first JPEG is produced, the pipeline is fully running and
-      // the 32 KB limit applies normally.
-      if (ffFirstFrameSeen && ffH265.stdin.writableLength > FF_STDIN_MAX) {
+      if (!ffFirstFrameSeen) {
+        // ── Startup drop: pipeline NULL→PLAYING takes 1-3 s; fdsrc does not
+        // read stdin until PLAYING state.  Writing every incoming frame queues
+        // 20-30 frames before the decoder starts, putting us permanently behind.
+        // Solution: write ONLY the first (startup) IDR; drop everything else
+        // until the decoder produces its first JPEG (ffFirstFrameSeen).
+        if (ffIdrWritten) {
+          // Startup IDR already sent — drop this NAL silently.
+          return;
+        }
+        if (!isIDR) return;  // still waiting for the first IDR — drop P/B frames
+        // First IDR: send it and mark as written.
+        ffIdrWritten = true;
+        console.error('[gst] startup IDR sent — dropping all NALs until first JPEG output');
+      } else if (ffH265.stdin.writableLength > FF_STDIN_MAX) {
+        // ── Mid-stream overrun: decoder can't keep up → kill and restart on IDR.
         console.error('[gst] stdin overrun — killing to reset latency (will restart on next IDR)');
         ffH265.kill();
         return;
