@@ -987,9 +987,10 @@
                   try { if (r.requestKeyFrame) r.requestKeyFrame(); } catch(_) {}
                 });
               } catch(_) {}
-              if (idrRetries % 3 === 0 && window._rtmSendAskVer) {
-                window._rtmSendAskVer().catch(() => {});
-                log('[h265] re-sent askVersion via RTM (retry#' + idrRetries + ')');
+              if (idrRetries % 3 === 0) {
+                if (window._rtmSendJoin) window._rtmSendJoin().catch(() => {});
+                if (window._rtmSendAskVer) window._rtmSendAskVer().catch(() => {});
+                log('[h265] re-sent join+askVersion via RTM (retry#' + idrRetries + ')');
               }
               if (idrRetries >= 30) {
                 clearInterval(idrTimer);
@@ -1108,8 +1109,11 @@
             // The user-unpublished event will fire when robot truly stops, and will reset
             // broadwayActive=false so the next user-published does a full fresh reinit.
             if (muted === true) {
-              log('[video] trk.muted → re-sending askVersion via RTM (no resubscribe)');
+              log('[video] trk.muted → re-sending join+askVersion via RTM (no resubscribe)');
               setTimeout(async () => {
+                try {
+                  if (window._rtmSendJoin) { await window._rtmSendJoin(); log('RTM join re-sent (muted)'); }
+                } catch(e) { log('[!] muted join failed: ' + e.message); }
                 try {
                   if (window._rtmSendAskVer) { await window._rtmSendAskVer(); log('RTM askVersion re-sent (muted)'); }
                 } catch(e) { log('[!] muted askVersion failed: ' + e.message); }
@@ -1332,21 +1336,40 @@
           throw e;
         }
 
-        const CMD_CONTROL  = 100900;
+        const CMD_CONTROL   = 100900;
         const SUBCMD_ASKVER = 500;
-        const askVer = makePacket(CMD_CONTROL, int32LE(SUBCMD_ASKVER));
+        const SUBCMD_JOIN   = 1;    // CONTROL_DRIVE_JOIN — tells robot a viewer is connecting
 
-        // Expose askVersion sender for re-use after subscription
+        // Expose senders for re-use after subscription / muted retries.
         window._rtmSendAskVer = async () => {
           await rtmClient.sendMessageToPeer(
             { rawMessage: makePacket(CMD_CONTROL, int32LE(SUBCMD_ASKVER)), description: 'askVersion' },
             cfg.rtm_uid_loona
           );
         };
+        window._rtmSendJoin = async () => {
+          await rtmClient.sendMessageToPeer(
+            { rawMessage: makePacket(CMD_CONTROL, int32LE(SUBCMD_JOIN)), description: 'join' },
+            cfg.rtm_uid_loona
+          );
+        };
+
+        // Send JOIN (cmd=1) first so the robot knows a control-mode viewer is
+        // connecting, then askVersion so it starts publishing.
+        // ControlToOpenViewModel (local TCP) sends sendControlCommand(1) on open.
+        try {
+          await rtmClient.sendMessageToPeer(
+            { rawMessage: makePacket(CMD_CONTROL, int32LE(SUBCMD_JOIN)), description: 'join' },
+            cfg.rtm_uid_loona
+          );
+          log('RTM join (cmd=1) sent');
+        } catch (e) {
+          log('[!] RTM join failed: ' + (e && (e.message || JSON.stringify(e))));
+        }
 
         try {
           await rtmClient.sendMessageToPeer(
-            { rawMessage: askVer, description: 'askVersion' },
+            { rawMessage: makePacket(CMD_CONTROL, int32LE(SUBCMD_ASKVER)), description: 'askVersion' },
             cfg.rtm_uid_loona
           );
           log('RTM askVersion sent');
