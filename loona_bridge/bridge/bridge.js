@@ -350,10 +350,14 @@ function findSdkFile(pkgName, candidates) {
   let ffFirstFrameSeen  = false;  // true after first JPEG output from current decoder instance
   // During pipeline startup (NULL→PLAYING) fdsrc does not read stdin.
   // Writing every incoming frame would queue up 20-30 frames before the decoder
-  // starts — permanently behind by 2-3 s.  Fix: write ONLY the first IDR to stdin,
-  // drop all subsequent NALs until the first JPEG is produced.  Once the decoder
-  // is live (ffFirstFrameSeen) normal per-frame writing resumes.
+  // starts — permanently behind by 2-3 s.
+  // Fix: write IDR + up to FF_STARTUP_NAL_MAX more P-frames ("priming"), then
+  // drop all subsequent NALs until the first JPEG is produced.
+  // avdec_h265 needs at least 1-2 P-frames after the IDR before it outputs
+  // the first decoded picture (B-frame reordering pipeline).
   let ffIdrWritten      = false;  // true after the startup IDR was sent to stdin
+  let ffStartupNalCount = 0;      // NALs written during startup (including IDR)
+  const FF_STARTUP_NAL_MAX = 6;   // IDR + 5 P-frames — enough to prime avdec_h265
 
   // First frame can take 3-5 s (V4L2M2M init or software codec startup).
   // After the first frame, 3 s silence = decode error → kill + wait for IDR.
@@ -426,8 +430,9 @@ function findSdkFile(pkgName, candidates) {
 
   function startFfmpeg() {
     if (ffH265) return;
-    ffFirstFrameSeen = false;  // reset per-instance flags
-    ffIdrWritten     = false;
+    ffFirstFrameSeen  = false;  // reset per-instance flags
+    ffIdrWritten      = false;
+    ffStartupNalCount = 0;
     const args = buildFfArgs();
     if (useHwDec) {
       probeHwDevice();  // log available /dev/videoN for diagnostics
@@ -521,19 +526,25 @@ function findSdkFile(pkgName, candidates) {
     }
     if (ffH265 && !ffH265.stdin.destroyed) {
       if (!ffFirstFrameSeen) {
-        // ── Startup drop: pipeline NULL→PLAYING takes 1-3 s; fdsrc does not
+        // ── Startup priming: pipeline NULL→PLAYING takes 1-3 s; fdsrc does not
         // read stdin until PLAYING state.  Writing every incoming frame queues
         // 20-30 frames before the decoder starts, putting us permanently behind.
-        // Solution: write ONLY the first (startup) IDR; drop everything else
+        // Solution: write IDR + FF_STARTUP_NAL_MAX P-frames, then drop the rest
         // until the decoder produces its first JPEG (ffFirstFrameSeen).
-        if (ffIdrWritten) {
-          // Startup IDR already sent — drop this NAL silently.
-          return;
+        // avdec_h265 needs a few frames after the IDR before it outputs anything
+        // (B-frame reordering pipeline) — sending only the IDR causes a 5 s stall.
+        if (!ffIdrWritten) {
+          if (!isIDR) return;  // no IDR yet — drop P/B frames
+          ffIdrWritten = true;
+          ffStartupNalCount = 1;  // IDR counts as first NAL
+          console.error('[gst] startup IDR sent — priming decoder (max ' +
+                        FF_STARTUP_NAL_MAX + ' frames)');
+        } else if (ffStartupNalCount >= FF_STARTUP_NAL_MAX) {
+          return;  // primed — drop all remaining NALs until first JPEG output
+        } else {
+          ffStartupNalCount++;
         }
-        if (!isIDR) return;  // still waiting for the first IDR — drop P/B frames
-        // First IDR: send it and mark as written.
-        ffIdrWritten = true;
-        console.error('[gst] startup IDR sent — dropping all NALs until first JPEG output');
+        // fall through to write this NAL
       } else if (ffH265.stdin.writableLength > FF_STDIN_MAX) {
         // ── Mid-stream overrun: decoder can't keep up → kill and restart on IDR.
         console.error('[gst] stdin overrun — killing to reset latency (will restart on next IDR)');
