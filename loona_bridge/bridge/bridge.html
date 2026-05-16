@@ -559,6 +559,10 @@
 
       // Guard: Broadway pipeline is set up only once per video session.
       let broadwayActive = false;
+      // Guard: video render + tick() + stats set up only once per video session.
+      // Separate from broadwayActive because audio handler may set broadwayActive first,
+      // which must not prevent the video render path from running.
+      let videoSessionActive = false;
 
       // ── Shared canvas/frame state (audio path + video path) ──────────────────
       // Hoisted here so both user-published handlers (audio and video) can access them.
@@ -688,8 +692,13 @@
               '        var m  = chunk.getMetadata ? chunk.getMetadata() : {};',
               '        var raw = chunk.data;',
               '        var u8 = new Uint8Array(raw instanceof ArrayBuffer ? raw.slice(0) : raw);',
-              '        var nt = u8.length > 0 ? (u8[0] & 0x1f) : -1;',
-              '        var ft = (nt===5 || (nt===28 && u8.length>1 && (u8[1]&0x80) && (u8[1]&0x1f)===5)) ? "IDR" : "P";',
+              '        var nt  = u8.length > 0 ? (u8[0] & 0x1f) : -1;',
+              '        var nt5 = u8.length > 0 ? ((u8[0] >> 1) & 0x3f) : -1;',
+              '        var ft  = "P";',
+              '        if (nt===5) ft="IDR";', // H264 single IDR NAL
+              '        if (nt===28 && u8.length>1 && (u8[1]&0x80) && (u8[1]&0x1f)===5) ft="IDR";', // H264 FU-A IDR
+              '        if (nt5===48) ft="IDR";', // H265 AP (contains VPS/SPS/PPS — key material)
+              '        if (nt5===49 && u8.length>2 && (u8[2]&0x80) && ((u8[2]&0x1f)===19||(u8[2]&0x1f)===20)) ft="IDR";', // H265 FU IDR_W_RADL/IDR_N_LP
               '        self.postMessage({ data: u8, ts: chunk.timestamp||0, seq: m.sequenceNumber||0, ft: ft }, [u8.buffer]);',
               '      } catch(_) {}',
               '      ctrl.enqueue(chunk);',
@@ -718,6 +727,38 @@
                 totalPktCount++;
                 const pktNum = totalPktCount;
                 if (!payload || payload.length < 1) return;
+
+                // ── H265 detection (RFC 7798) ────────────────────────────────
+                // H265 nal_unit_type = (byte0 >> 1) & 0x3f
+                // AP=48 (0x60): aggregation packet — carries VPS/SPS/PPS
+                // FU=49 (0x62): fragmentation unit — carries large slices
+                // Broadway.js is H264-only and cannot decode H265.
+                // Firefox decodes H265 natively; canvas capture via tick() handles it.
+                const nt265 = (payload[0] >> 1) & 0x3f;
+                if (nt265 === 48) {
+                  // H265 AP: treat as key material → stop IDR retry timer
+                  bwHasIDR = true;
+                  if (pktNum <= 10)
+                    log('[broadway] recv#' + idx + ' pkt#' + pktNum +
+                        ' H265-AP (VPS/SPS/PPS) ' + payload.length + 'B — Firefox native decode');
+                  return;
+                }
+                if (nt265 === 49) {
+                  // H265 FU: fur_type in byte2 bits[4:0]
+                  if (payload.length < 3) return;
+                  const fuHdr265  = payload[2];
+                  const startBit  = (fuHdr265 & 0x80) !== 0;
+                  const furType   = fuHdr265 & 0x1f;
+                  const isIDR265  = (furType === 19 || furType === 20); // IDR_W_RADL / IDR_N_LP
+                  if (isIDR265 && startBit) bwHasIDR = true;
+                  if (pktNum <= 10 || pktNum % 300 === 0)
+                    log('[broadway] recv#' + idx + ' pkt#' + pktNum +
+                        ' H265-FU fur=' + furType + (isIDR265 ? '(IDR)' : '') +
+                        ' start=' + startBit + ' ' + payload.length + 'B — Firefox native decode');
+                  return;
+                }
+
+                // ── H264 parsing below ───────────────────────────────────────
                 const naluType = payload[0] & 0x1f;
 
                 if (naluType === 28) {
@@ -837,12 +878,13 @@
         })(0);
       }
 
-      // Reset broadwayActive when robot unpublishes so next user-published does full reinit.
+      // Reset session guards when robot unpublishes so next user-published does full reinit.
       rtcClient.on('user-unpublished', (user, mediaType) => {
         log('[rtc] user-unpublished uid=' + user.uid + ' mediaType=' + mediaType);
         if (mediaType === 'video') {
           broadwayActive = false;
-          log('[broadway] reset broadwayActive=false — will reinit on next user-published');
+          videoSessionActive = false;
+          log('[broadway] reset broadwayActive+videoSessionActive=false — will reinit on next user-published');
         }
       });
 
@@ -871,11 +913,21 @@
           try { await window._rtmSendAskVer(); log('RTM askVersion re-sent after subscribe'); }
           catch(e) { log('[!] RTM askVersion re-send failed: ' + e.message); }
         }
-        if (broadwayActive) {
-          log('[video] already running — resubscribe complete, new IDR expected');
+        // broadwayActive may already be true if audio handler fired first and scheduled
+        // installBroadway(). Track Broadway install separately from video render session
+        // so tick()+stats always run on the FIRST video subscription regardless of order.
+        const needBroadway = !broadwayActive;
+        if (needBroadway) broadwayActive = true;
+
+        if (videoSessionActive) {
+          // True resubscribe: Broadway already installed, render already running.
+          log('[video] resubscribed — Broadway already running, IDR expected');
+          if (user.videoTrack) {
+            try { await user.videoTrack.play(document.getElementById('remote-container')); } catch(_) {}
+          }
           return;
         }
-        broadwayActive = true;
+        videoSessionActive = true;
 
         const remoteTrack = user.videoTrack;
 
@@ -890,9 +942,9 @@
           }
         }
 
-        // Install Broadway H264 decoder (shared with audio path).
-        // installBroadway() defined at startAgora scope (before user-published listener).
-        installBroadway();
+        // Install Broadway only if audio handler hasn't done so yet.
+        // Primary decode is Firefox native H265/H264; Broadway is a software H264 fallback.
+        if (needBroadway) installBroadway();
 
         // ── Frame-counter removed (v0.1.71): Broadway now installs on ALL receivers
         // and logs per-receiver info (recv#N meta, H264-pkt#N, hex-dump) directly.
@@ -908,7 +960,7 @@
         if (videoEl) {
           log('[video] ✓ <video> ready: ' + videoEl.videoWidth + 'x' + videoEl.videoHeight);
         } else {
-          log('[video] ✗ no decoded video after 10 s — H.264/GMP not working');
+          log('[video] ✗ no decoded video after 10 s — codec not decoding (H264/GMP or H265/VA-API?)');
           const v = container.querySelector('video');
           if (v) {
             const tracks = v.srcObject ? v.srcObject.getTracks() : [];
