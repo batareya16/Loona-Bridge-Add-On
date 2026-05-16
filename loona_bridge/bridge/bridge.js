@@ -394,7 +394,8 @@ function findSdkFile(pkgName, candidates) {
     return [
       '-loglevel', 'error',
       '-fflags', '+nobuffer+discardcorrupt',
-      '-flags', '+low_delay',
+      // NOTE: -flags +low_delay removed — it disables B-frame reordering which
+      // causes "Could not find ref with POC N" errors when robot sends B-frames.
       '-analyzeduration', '0',
       '-probesize', '32',
       '-f', 'hevc',
