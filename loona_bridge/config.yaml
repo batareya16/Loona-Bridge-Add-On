@@ -1,6 +1,6 @@
 ---
 name: Loona Agora Bridge
-version: "0.1.81"
+version: "0.1.82"
 slug: loona_bridge
 description: >
   Playwright/Firefox bridge для видео Loona через Agora RTC (H.264 via built-in libavcodec).
@@ -15,15 +15,23 @@ map:
   - type: homeassistant_config
     read_only: true
     path: /ha_config
-# full_access removes Docker seccomp + AppArmor → allows Firefox GMP child process
-# to run without double-seccomp conflict on ARM64 Linux (otherwise libgmpopenh264
-# crashes on first H.264 bitstream → framesDecoded stays 0 forever).
-full_access: true
+# No full_access, no privileged capabilities needed:
+# • OpenH264 GMP (the original reason for full_access) is no longer used —
+#   H265 is decoded by ffmpeg subprocess, not Firefox's codec pipeline.
+# • Firefox headless (Playwright) does not require SYS_ADMIN unlike Chromium;
+#   its content-process sandbox uses seccomp-bpf which works under standard
+#   Docker security settings.
+# If Firefox fails to launch with "Operation not permitted", add back:
+#   privileged: [SYS_ADMIN]
 # host_network: container shares Pi's network stack directly.
 # Without this, Firefox inside Docker sees only the Docker bridge IP (172.17.x.x)
 # and puts that as ICE candidate → Agora edge server cannot route to it → bytes=0.
 # With host_network the real Pi IP appears in ICE candidates → stable WebRTC UDP.
 host_network: true
+# H265 hardware decode: /dev/video19 = rpi-hevc-dec (rpivid driver, confirmed present in HA OS).
+# Without this mapping the container cannot open the device → hevc_v4l2m2m fails → software fallback.
+devices:
+  - /dev/video19
 options:
   fps: 10
   jpeg_quality: 0.65

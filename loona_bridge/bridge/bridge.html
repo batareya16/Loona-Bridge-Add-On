@@ -751,13 +751,15 @@
               // ── Track C: Node.js ffmpeg (primary on ARM64 Linux) ─────────────
               // bridge.js exposes __h265FeedNAL via page.exposeFunction.
               // Data is base64-encoded to avoid Uint8Array serialization issues.
+              // isIDR is passed so bridge.js knows when to (re)start ffmpeg —
+              // after a kill/exit, ffmpeg must not start until a clean IDR arrives.
               if (typeof window.__h265FeedNAL === 'function') {
                 try {
                   // Chunked String.fromCharCode avoids call-stack overflow on large frames
                   const SZ = 0x8000; let s = '';
                   for (let i = 0; i < annexB.length; i += SZ)
                     s += String.fromCharCode.apply(null, annexB.subarray(i, i + SZ));
-                  window.__h265FeedNAL(btoa(s));
+                  window.__h265FeedNAL(btoa(s), isIDR);
                 } catch(e) { log('[h265] feedNAL b64 err: ' + e.message); }
                 return; // Node.js path is primary
               }
@@ -842,22 +844,10 @@
                   if (newParams.length > 0) {
                     h265ParamSets = newParams;
                     log('[h265] param sets stored (' + h265ParamSets.length + ' NALs)');
-                    // Feed param sets to Node.js ffmpeg pipeline (Track C)
-                    if (typeof window.__h265FeedNAL === 'function') {
-                      let pLen = 0;
-                      newParams.forEach(n => { pLen += 4 + n.length; });
-                      const pAB = new Uint8Array(pLen); let pOff = 0;
-                      newParams.forEach(n => {
-                        pAB[pOff]=0; pAB[pOff+1]=0; pAB[pOff+2]=0; pAB[pOff+3]=1; pOff+=4;
-                        pAB.set(n, pOff); pOff += n.length;
-                      });
-                      try {
-                        const SZ = 0x8000; let s = '';
-                        for (let i = 0; i < pAB.length; i += SZ)
-                          s += String.fromCharCode.apply(null, pAB.subarray(i, i + SZ));
-                        window.__h265FeedNAL(btoa(s));
-                      } catch(_) {}
-                    }
+                    // NOTE: param sets are NOT forwarded to ffmpeg (Track C) here.
+                    // Sending VPS/SPS/PPS mid-stream (outside IDR) confuses ffmpeg's
+                    // HEVC parser → "PPS id out of range" → cascading decode errors.
+                    // They are injected by feedH265() only when an IDR arrives.
                     // Feed param sets to VideoDecoder (Track B fallback)
                     if (videoDecoder && videoDecoder.state === 'configured') {
                       newParams.forEach(n => {

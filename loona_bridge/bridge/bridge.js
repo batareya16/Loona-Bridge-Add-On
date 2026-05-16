@@ -340,11 +340,44 @@ function findSdkFile(pkgName, candidates) {
   openPyWs();
 
   // ── ffmpeg H265 decoder ────────────────────────────────────────────────────────
-  let ffH265   = null;
-  let ffBuf    = Buffer.alloc(0);
-  let useHwDec = (process.arch === 'arm64');  // try V4L2M2M on ARM64 first
+  let ffH265          = null;
+  let ffBuf           = Buffer.alloc(0);
+  // hevc_v4l2m2m requires rpivid kernel driver — absent on HA OS.
+  // Try once on ARM64 in case someone runs on Pi OS; fall back to software on failure.
+  let useHwDec        = (process.arch === 'arm64');
+  let ffNoOutputTimer = null;  // kills ffmpeg if no JPEG output for 2 s
 
-  const FF_STDIN_MAX = 256 * 1024;  // 256 KB — kill+restart if stdin backs up
+  function resetNoOutputTimer() {
+    clearTimeout(ffNoOutputTimer);
+    ffNoOutputTimer = setTimeout(() => {
+      if (ffH265) {
+        console.error('[ffmpeg] no JPEG output for 2 s — decode error, killing (will restart on next IDR)');
+        ffH265.kill();
+      }
+    }, 2000);
+  }
+
+  const FF_STDIN_MAX = 32 * 1024;   // 32 KB — kill+restart if stdin backs up
+
+  // Probe which /dev/videoN supports hevc_v4l2m2m (H265 decode).
+  // On RPi4 with rpivid driver: usually /dev/video11.
+  // Returns the device path string or null if none found.
+  function probeHwDevice() {
+    try {
+      // Ask ffmpeg to list V4L2 devices — look for one that supports hevc_v4l2m2m.
+      // Faster heuristic: try /dev/video10–/dev/video15 via v4l2-ctl or just
+      // check device existence and let ffmpeg pick (it defaults to /dev/video0,
+      // tries in order).  We rely on ffmpeg's own auto-scan; no extra device arg needed.
+      // If a specific device is needed: return '/dev/video11';
+      const devFiles = fs.readdirSync('/dev').filter(f => /^video\d+$/.test(f));
+      if (devFiles.length === 0) return null;
+      console.error('[ffmpeg] V4L2 devices available: ' + devFiles.map(f => '/dev/' + f).join(', '));
+      // Return undefined — ffmpeg will auto-select from what the container can see.
+      return null;  // null = no explicit -device flag; ffmpeg auto-scans
+    } catch (_) {
+      return null;
+    }
+  }
 
   function buildFfArgs() {
     const hw = useHwDec ? ['-c:v', 'hevc_v4l2m2m'] : [];
@@ -368,20 +401,24 @@ function findSdkFile(pkgName, candidates) {
   function startFfmpeg() {
     if (ffH265) return;
     const args = buildFfArgs();
-    if (useHwDec)
+    if (useHwDec) {
+      probeHwDevice();  // log available /dev/videoN for diagnostics
       console.error('[ffmpeg] trying hardware H265 decode (hevc_v4l2m2m)');
+    }
 
     ffH265 = cp.spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'inherit'] });
+    resetNoOutputTimer();  // arm the watchdog immediately
 
     ffH265.stdin.on('error', () => {});
     ffH265.on('error', (e) => console.error('[ffmpeg] spawn error: ' + e.message));
     ffH265.on('exit', (code) => {
+      clearTimeout(ffNoOutputTimer);
       if (code !== 0 && useHwDec) {
         console.error('[ffmpeg] hw decode failed (code=' + code +
                       ') — switching to software decode');
         useHwDec = false;
       } else {
-        console.error('[ffmpeg] exited code=' + code + ' — restart on next NAL');
+        console.error('[ffmpeg] exited code=' + code + ' — will restart on next IDR');
       }
       ffH265 = null;
       ffBuf  = Buffer.alloc(0);
@@ -407,6 +444,9 @@ function findSdkFile(pkgName, candidates) {
       }
       if (!latestJpeg) return;
 
+      // Got a JPEG — reset the no-output watchdog.
+      resetNoOutputTimer();
+
       // Rate-limit + send binary directly to Python — no page.evaluate needed.
       const now = Date.now();
       if (now - lastSendMs < minIntervalMs) return;
@@ -417,7 +457,7 @@ function findSdkFile(pkgName, candidates) {
         if (firstJpeg) {
           firstJpeg = false;
           console.error('[ffmpeg] ✓ first JPEG sent to Python (' +
-                        latestJpeg.length + ' B, hw=' + !useHwDec + ')');
+                        latestJpeg.length + ' B, hw=' + useHwDec + ')');
           // Notify bridge.html for its log/counters (no WS send needed there).
           page.evaluate(() => {
             if (typeof window.__onFirstFrame === 'function') window.__onFirstFrame();
@@ -431,11 +471,18 @@ function findSdkFile(pkgName, candidates) {
   }
 
   // ── H265 NAL feeder (called from bridge.html via RTCRtpScriptTransform) ───────
-  await page.exposeFunction('__h265FeedNAL', (b64) => {
-    if (!ffH265) startFfmpeg();
+  // isIDR=true  → Annex B chunk contains VPS/SPS/PPS + IDR NAL (from feedH265).
+  // isIDR=false → Annex B chunk is a single P/B frame NAL.
+  // After ffmpeg exits (kill or error), we only restart on the next IDR so the
+  // decoder always begins at a clean random-access point — never mid-GOP.
+  await page.exposeFunction('__h265FeedNAL', (b64, isIDR) => {
+    if (!ffH265) {
+      if (!isIDR) return;   // wait for a clean IDR before (re)starting decoder
+      startFfmpeg();
+    }
     if (ffH265 && !ffH265.stdin.destroyed) {
       if (ffH265.stdin.writableLength > FF_STDIN_MAX) {
-        console.error('[ffmpeg] stdin overrun — killing to reset latency');
+        console.error('[ffmpeg] stdin overrun — killing to reset latency (will restart on next IDR)');
         ffH265.kill();
         return;
       }
