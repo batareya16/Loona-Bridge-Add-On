@@ -357,7 +357,13 @@ function findSdkFile(pkgName, candidates) {
   // the first decoded picture (B-frame reordering pipeline).
   let ffIdrWritten      = false;  // true after the startup IDR was sent to stdin
   let ffStartupNalCount = 0;      // NALs written during startup (including IDR)
-  const FF_STARTUP_NAL_MAX = 6;   // IDR + 5 P-frames — enough to prime avdec_h265
+  const FF_STARTUP_NAL_MAX = 2;   // IDR + 1 P-frame — minimum to prime avdec_h265
+  // ── Real-time latency control ──────────────────────────────────────────────────
+  // Track frames written to stdin but not yet decoded (output as JPEG).
+  // If the decoder falls behind, drop incoming frames rather than letting the
+  // stdin buffer grow — this caps latency at MAX_PENDING_FRAMES × frame_interval.
+  let ffPendingFrames   = 0;
+  const MAX_PENDING_FRAMES = 3;   // ≈300 ms at 10 fps; drop incoming when exceeded
 
   // First frame can take 3-5 s (V4L2M2M init or software codec startup).
   // After the first frame, 3 s silence = decode error → kill + wait for IDR.
@@ -433,6 +439,7 @@ function findSdkFile(pkgName, candidates) {
     ffFirstFrameSeen  = false;  // reset per-instance flags
     ffIdrWritten      = false;
     ffStartupNalCount = 0;
+    ffPendingFrames   = 0;
     const args = buildFfArgs();
     if (useHwDec) {
       probeHwDevice();  // log available /dev/videoN for diagnostics
@@ -487,8 +494,15 @@ function findSdkFile(pkgName, candidates) {
       }
       if (!latestJpeg) return;
 
-      // Got a JPEG — mark first frame seen and reset the no-output watchdog.
-      ffFirstFrameSeen = true;
+      // Got a JPEG — update pending-frame counter and reset the no-output watchdog.
+      if (!ffFirstFrameSeen) {
+        ffFirstFrameSeen = true;
+        // We wrote ffStartupNalCount frames during priming; first JPEG consumed one.
+        // Remaining priming frames are still pending in the decoder.
+        ffPendingFrames = Math.max(0, ffStartupNalCount - 1);
+      } else {
+        if (ffPendingFrames > 0) ffPendingFrames--;
+      }
       resetNoOutputTimer();
 
       // Rate-limit + send binary directly to Python — no page.evaluate needed.
@@ -545,12 +559,18 @@ function findSdkFile(pkgName, candidates) {
           ffStartupNalCount++;
         }
         // fall through to write this NAL
+      } else if (ffPendingFrames >= MAX_PENDING_FRAMES) {
+        // ── Decoder behind: drop this frame to maintain real-time output.
+        // Don't kill — just skip.  When the decoder catches up (outputs a JPEG),
+        // ffPendingFrames drops below the limit and normal writing resumes.
+        return;
       } else if (ffH265.stdin.writableLength > FF_STDIN_MAX) {
-        // ── Mid-stream overrun: decoder can't keep up → kill and restart on IDR.
+        // ── Last-resort overrun guard (should rarely fire given pending-frame cap).
         console.error('[gst] stdin overrun — killing to reset latency (will restart on next IDR)');
         ffH265.kill();
         return;
       }
+      ffPendingFrames++;
       try { ffH265.stdin.write(Buffer.from(b64, 'base64')); } catch (_) {}
     }
   });
