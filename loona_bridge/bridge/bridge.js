@@ -396,7 +396,7 @@ function findSdkFile(pkgName, candidates) {
     if (useHwDec) {
       return [
         '-q',                           // suppress pipeline state messages
-        'fdsrc', 'fd=0', 'is-live=true', 'blocksize=131072',
+        'fdsrc', 'fd=0', 'blocksize=131072',
         '!', 'h265parse',
         '!', 'v4l2h265dec', 'device=/dev/video19',
         '!', 'videoconvert',
@@ -406,7 +406,7 @@ function findSdkFile(pkgName, candidates) {
     } else {
       return [
         '-q',
-        'fdsrc', 'fd=0', 'is-live=true', 'blocksize=131072',
+        'fdsrc', 'fd=0', 'blocksize=131072',
         '!', 'h265parse',
         '!', 'avdec_h265', 'max-threads=2',
         '!', 'videoconvert',
