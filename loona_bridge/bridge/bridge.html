@@ -988,9 +988,10 @@
                 });
               } catch(_) {}
               if (idrRetries % 3 === 0) {
-                if (window._rtmSendJoin) window._rtmSendJoin().catch(() => {});
-                if (window._rtmSendAskVer) window._rtmSendAskVer().catch(() => {});
-                log('[h265] re-sent join+askVersion via RTM (retry#' + idrRetries + ')');
+                if (window._rtmEnterControlMode) {
+                  window._rtmEnterControlMode().catch(() => {});
+                  log('[h265] re-sent enter-control-mode via RTM (retry#' + idrRetries + ')');
+                }
               }
               if (idrRetries >= 30) {
                 clearInterval(idrTimer);
@@ -1109,14 +1110,12 @@
             // The user-unpublished event will fire when robot truly stops, and will reset
             // broadwayActive=false so the next user-published does a full fresh reinit.
             if (muted === true) {
-              log('[video] trk.muted → re-sending join+askVersion via RTM (no resubscribe)');
+              log('[video] trk.muted → re-sending full enter-control-mode sequence via RTM');
               setTimeout(async () => {
                 try {
-                  if (window._rtmSendJoin) { await window._rtmSendJoin(); log('RTM join re-sent (muted)'); }
-                } catch(e) { log('[!] muted join failed: ' + e.message); }
-                try {
-                  if (window._rtmSendAskVer) { await window._rtmSendAskVer(); log('RTM askVersion re-sent (muted)'); }
-                } catch(e) { log('[!] muted askVersion failed: ' + e.message); }
+                  if (window._rtmEnterControlMode) await window._rtmEnterControlMode();
+                  log('RTM enter-control-mode re-sent (muted)');
+                } catch(e) { log('[!] muted enter-control-mode failed: ' + e.message); }
               }, 2000);
             }
           } else {
@@ -1318,8 +1317,14 @@
             // cmd=404 = GAME_ERROR status; subcmd=40000=robot fell, subcmd=50000=robot stood up
             // cmd=100900 + subcmd=500 = askVersion response (version data follows at byte 8+)
             const label = (cmd === 404) ? ('status/body=' + subcmd) :
-                          (cmd === 100900 && subcmd === 500) ? 'askVersion-response' : '';
+                          (cmd === 100900 && subcmd === 500) ? 'askVersion-response' :
+                          (cmd === 100900 && subcmd === 400) ? 'JOIN-ack / control-mode-active' : '';
             log('RTM<- cmd=' + cmd + (subcmd !== -1 ? ' sub=' + subcmd : '') + ' bytes=' + u8.length + (label ? ' [' + label + ']' : ''));
+            // sub=400 = robot confirmed it entered control mode → it will publish
+            if (cmd === 100900 && subcmd === 400) {
+              robotInControlMode = true;
+              log('[rtm] ✓ Robot entered control mode (sub=400) — should start publishing');
+            }
             if (ws.readyState === 1) {
               try {
                 ws.send(JSON.stringify({type: 'rtm', peer: peerId, cmd, bytes: Array.from(u8)}));
@@ -1336,9 +1341,13 @@
           throw e;
         }
 
-        const CMD_CONTROL   = 100900;
-        const SUBCMD_ASKVER = 500;
-        const SUBCMD_JOIN   = 1;    // CONTROL_DRIVE_JOIN — tells robot a viewer is connecting
+        const CMD_CONTROL         = 100900;
+        const SUBCMD_ASKVER       = 500;
+        const SUBCMD_JOIN         = 1;    // CONTROL_DRIVE_JOIN
+        const SUBCMD_CONFIRM_LOCAL = 6;   // confirm local WiFi mode (also needed in remote RTM path)
+        // sub=400 in robot→us = robot entered control mode (ack to our JOIN).
+        // Track receipt so we stop retrying and know robot is publishing.
+        let   robotInControlMode  = false;
 
         // Expose senders for re-use after subscription / muted retries.
         // Called from bridge.js (via page.evaluate) after each decoder kill/restart
@@ -1367,29 +1376,56 @@
             cfg.rtm_uid_loona
           );
         };
-
-        // Send JOIN (cmd=1) first so the robot knows a control-mode viewer is
-        // connecting, then askVersion so it starts publishing.
-        // ControlToOpenViewModel (local TCP) sends sendControlCommand(1) on open.
-        try {
+        // CTRL_CONFIRM_LOCAL — mirrors TCP step 3 (app sends after JOIN ack).
+        // Robot may require this before it starts publishing even in RTM-only mode.
+        window._rtmSendConfirmLocal = async () => {
+          const body = new Uint8Array(8);
+          const dv = new DataView(body.buffer);
+          dv.setInt32(0, SUBCMD_CONFIRM_LOCAL, true);
+          dv.setInt32(4, 0, true);
           await rtmClient.sendMessageToPeer(
-            { rawMessage: makePacket(CMD_CONTROL, int32LE(SUBCMD_JOIN)), description: 'join' },
+            { rawMessage: makePacket(CMD_CONTROL, body), description: 'confirmLocal' },
             cfg.rtm_uid_loona
           );
-          log('RTM join (cmd=1) sent');
+        };
+        // Full "enter control mode" sequence: JOIN → CONFIRM_LOCAL → askVersion.
+        // Mirrors the local TCP sequence the app uses:
+        //   sendControlCommand(1) → ack [1,0] → sendControlCommand(6,0) → video starts.
+        window._rtmEnterControlMode = async () => {
+          await window._rtmSendJoin();
+          await new Promise(r => setTimeout(r, 300));
+          await window._rtmSendConfirmLocal();
+          await new Promise(r => setTimeout(r, 300));
+          await window._rtmSendAskVer();
+          log('[rtm] enter-control-mode sequence sent (join+confirmLocal+askVersion)');
+        };
+
+        // Initial enter-control-mode sequence: JOIN → CONFIRM_LOCAL → askVersion.
+        // Mirrors local TCP: sendControlCommand(1) → ack → sendControlCommand(6,0).
+        try {
+          await window._rtmEnterControlMode();
         } catch (e) {
-          log('[!] RTM join failed: ' + (e && (e.message || JSON.stringify(e))));
+          log('[!] RTM enter-control-mode failed: ' + (e && (e.message || JSON.stringify(e))));
         }
 
-        try {
-          await rtmClient.sendMessageToPeer(
-            { rawMessage: makePacket(CMD_CONTROL, int32LE(SUBCMD_ASKVER)), description: 'askVersion' },
-            cfg.rtm_uid_loona
-          );
-          log('RTM askVersion sent');
-        } catch (e) {
-          log('[!] RTM sendMessageToPeer failed: ' + (e && (e.message || JSON.stringify(e))));
-        }
+        // ── ICE-triggered retry ──────────────────────────────────────────────────
+        // When ICE first reaches "connected" re-send the full sequence.
+        // The robot may not have been RTM-connected at initial send time, or
+        // its media pipeline may not have been ready to act on it.
+        let iceEnteredControlMode = false;
+        const icePollTimer = setInterval(() => {
+          if (robotInControlMode) { clearInterval(icePollTimer); return; }
+          const pc = findBestPC(rtcClient);
+          if (!pc) return;
+          const s = pc.iceConnectionState;
+          if ((s === 'connected' || s === 'completed') && !iceEnteredControlMode) {
+            iceEnteredControlMode = true;
+            clearInterval(icePollTimer);
+            log('[rtm] ICE connected — re-sending enter-control-mode sequence');
+            window._rtmEnterControlMode().catch(e =>
+              log('[!] ICE-triggered control-mode failed: ' + e.message));
+          }
+        }, 500);
 
         // Stash for later (Python may want to send commands too via window.rtmSend()).
         window.rtmSend = async (cmdCode, bodyBytes) => {
