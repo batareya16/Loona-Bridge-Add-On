@@ -504,9 +504,12 @@ function findSdkFile(pkgName, candidates) {
       // Got a JPEG — update pending-frame counter and reset the no-output watchdog.
       if (!ffFirstFrameSeen) {
         ffFirstFrameSeen = true;
-        // We wrote ffStartupNalCount frames during priming; first JPEG consumed one.
-        // Remaining priming frames are still pending in the decoder.
-        ffPendingFrames = Math.max(0, ffStartupNalCount - 1);
+        // Priming done — resume normal frame input immediately.
+        // BUG if set to ffStartupNalCount-1 (e.g. 9): avdec_h265 needs CONTINUOUS
+        // input to flush its reorder buffer.  With pending=9 >= MAX_PENDING_FRAMES=3,
+        // ALL new frames were dropped → decoder starved → 1 JPEG per instance →
+        // 3s stall → kill loop.  Reset to 0 so the next incoming frame is written.
+        ffPendingFrames = 0;
       } else {
         if (ffPendingFrames > 0) ffPendingFrames--;
       }
