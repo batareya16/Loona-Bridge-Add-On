@@ -142,12 +142,16 @@
         if (ssrcLines.length > 0) {
           ssrcLines.forEach(l => console.log('[sdp-ssrc] found: ' + l));
         } else {
-          console.log('[sdp-ssrc] no a=ssrc:40000 in remote offer — will inject cname');
+          // No a=ssrc:40000 in offer — DO NOT inject synthetic ssrc.
+          // Injecting 'a=ssrc:40000 cname:loona-video' into the video section forces
+          // SSRC=40000 (robot's H265 stream) to the video receiver, which only has
+          // VP8/VP9 codecs → codec mismatch → Agora drops packets → robot never sends
+          // H265 → sub=400 never comes.  Leave SDP unchanged; PT-based demux handles it.
+          console.log('[sdp-ssrc] no a=ssrc:40000 in remote offer — not injecting (PT-based demux)');
+          return sdp;
         }
-        // Build toInject: use found lines, or synthesize a cname entry
-        const toInject = ssrcLines.length > 0
-          ? ssrcLines
-          : ['a=ssrc:40000 cname:loona-video'];
+        // Build toInject: use the found lines (synthetic injection path removed above)
+        const toInject = ssrcLines;
         const out = [];
         let inAud = false, inVid = false;
         for (const l of lines) {
@@ -1038,8 +1042,12 @@
           return;
         }
         if (mediaType !== 'video') return;
-        await rtcClient.subscribe(user, mediaType);
-        log('subscribed uid=' + user.uid + ' ' + mediaType);
+        // v0.1.94: Do NOT subscribe to video. Subscribing forces Agora to negotiate
+        // VP8/VP9 for the video receiver (H265 is never in Firefox's video recv codec list).
+        // When robot sees VP8/VP9-only receiver, it refuses to publish H265 → sub=400 never
+        // comes → no RTP packets.  RTCRtpScriptTransform on all receivers captures H265
+        // regardless of Agora subscription; installBroadway() handles actual decoding.
+        log('[video] user-published uid=' + user.uid + ' — skip subscription (RTCRtpScriptTransform path)');
         // Re-send askVersion after subscription — robot may need this as a trigger
         // to continue publishing. First send happens during RTM init (before user-published).
         // Second send here ensures robot gets it after we've confirmed it's in the channel.
