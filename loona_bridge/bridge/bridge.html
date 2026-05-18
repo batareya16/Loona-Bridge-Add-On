@@ -127,12 +127,19 @@
       // audio inbound-rtp entry and can handle it differently.
 
       // ── SSRC=40000 → video section mover ────────────────────────────────────
-      // Firefox SSRC-first demux: when remote SDP declares a=ssrc:40000 in the
-      // audio m-section (common when Agora edge mis-maps the video SSRC), ALL
-      // packets with SSRC=40000 go to the audio receiver regardless of PT.
-      // If no a=ssrc lines at all: Firefox falls back to PT=0=PCMU (RFC 3551
-      // static table) → same result: video packets fed to audio pipeline.
-      // Fix: strip a=ssrc:40000 from audio, inject into video.
+      // Firefox SSRC-first demux: when remote SDP has a=ssrc:40000 bound to
+      // the audio m-section, Firefox routes ALL packets with SSRC=40000 to the
+      // audio receiver regardless of PT — which is exactly what we want, because
+      // the robot sends H265 as SSRC=40000 on the "audio" channel (PT=0/PCMU slot).
+      // RTCRtpScriptTransform on the audio receiver then intercepts the raw H265 RTP.
+      //
+      // Problem cases:
+      //   (A) Agora edge puts a=ssrc:40000 in the VIDEO m-section → Firefox routes
+      //       SSRC=40000 to the video receiver (VP8/VP9 codec) → mismatch → no decode.
+      //   (B) No a=ssrc lines at all → Firefox doesn't associate SSRC=40000 with any
+      //       receiver → track stays muted → totalPkt=0.
+      //
+      // Fix for both cases: strip a=ssrc:40000 from everywhere, inject into AUDIO.
       // Applied to remote offer only (setRemoteDescription).
       function fixSsrc40000(sdp) {
         const sep  = sdp.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
@@ -142,46 +149,47 @@
         if (ssrcLines.length > 0) {
           ssrcLines.forEach(l => console.log('[sdp-ssrc] found: ' + l));
         } else {
-          // No a=ssrc:40000 in offer — DO NOT inject synthetic ssrc.
-          // Injecting 'a=ssrc:40000 cname:loona-video' into the video section forces
-          // SSRC=40000 (robot's H265 stream) to the video receiver, which only has
-          // VP8/VP9 codecs → codec mismatch → Agora drops packets → robot never sends
-          // H265 → sub=400 never comes.  Leave SDP unchanged; PT-based demux handles it.
-          console.log('[sdp-ssrc] no a=ssrc:40000 in remote offer — not injecting (PT-based demux)');
-          return sdp;
+          // No a=ssrc:40000 in offer — synthesize one.
+          // Without an explicit ssrc binding Firefox won't demux SSRC=40000 to any
+          // receiver and the track stays muted (totalPkt=0 forever).
+          console.log('[sdp-ssrc] no a=ssrc:40000 in remote offer — will inject synthetic into audio');
         }
-        // Build toInject: use the found lines (synthetic injection path removed above)
-        const toInject = ssrcLines;
+        // Use found lines, or a synthetic cname entry when none are present.
+        const toInject = ssrcLines.length > 0
+          ? ssrcLines
+          : ['a=ssrc:40000 cname:loona-video'];
         const out = [];
         let inAud = false, inVid = false;
         for (const l of lines) {
           if (/^m=/.test(l)) { inAud = /^m=audio/.test(l); inVid = /^m=video/.test(l); }
-          // Drop a=ssrc:40000 from everywhere (will re-add only to video)
+          // Strip a=ssrc:40000 from everywhere — will re-add to audio only.
           if (/^a=ssrc:40000\b/.test(l)) {
             console.log('[sdp-ssrc] removed from ' + (inAud ? 'audio' : inVid ? 'video' : '?') + ': ' + l.slice(0, 60));
             continue;
           }
           out.push(l);
         }
-        // Find end of video section and splice in the ssrc lines
+        // Find end of AUDIO section and splice in the ssrc lines.
+        // Audio receiver is where H265 packets arrive (PT=0/PCMU slot).
+        // RTCRtpScriptTransform on the audio receiver captures raw H265 RTP.
         let insertIdx = -1;
-        inVid = false;
+        inAud = false;
         for (let i = 0; i < out.length; i++) {
           if (/^m=/.test(out[i])) {
-            if (inVid) { insertIdx = i; inVid = false; }
-            if (/^m=video/.test(out[i])) inVid = true;
+            if (inAud) { insertIdx = i; inAud = false; }
+            if (/^m=audio/.test(out[i])) inAud = true;
           }
         }
-        if (inVid) {
+        if (inAud) {
           let last = out.length - 1;
           while (last >= 0 && out[last] === '') last--;
           insertIdx = last + 1;
         }
         if (insertIdx >= 0) {
           out.splice(insertIdx, 0, ...toInject);
-          console.log('[sdp-ssrc] injected ' + toInject.length + ' a=ssrc:40000 line(s) into video section');
+          console.log('[sdp-ssrc] injected ' + toInject.length + ' a=ssrc:40000 line(s) into AUDIO section');
         } else {
-          console.log('[sdp-ssrc] WARNING: no video section found — ssrc not injected');
+          console.log('[sdp-ssrc] WARNING: no audio section found — ssrc not injected');
         }
         return out.join(sep);
       }
