@@ -1050,12 +1050,14 @@
           return;
         }
         if (mediaType !== 'video') return;
-        // v0.1.94: Do NOT subscribe to video. Subscribing forces Agora to negotiate
-        // VP8/VP9 for the video receiver (H265 is never in Firefox's video recv codec list).
-        // When robot sees VP8/VP9-only receiver, it refuses to publish H265 → sub=400 never
-        // comes → no RTP packets.  RTCRtpScriptTransform on all receivers captures H265
-        // regardless of Agora subscription; installBroadway() handles actual decoding.
-        log('[video] user-published uid=' + user.uid + ' — skip subscription (RTCRtpScriptTransform path)');
+        // Subscribe to video — required for Agora edge to forward any RTP packets.
+        // Without subscribe(), edge silently delivers nothing (bytes=0 forever).
+        // VP8/VP9 on the video receiver is OK: fixSsrc40000 injects a=ssrc:40000 into
+        // the AUDIO m-section, so robot's H265 (SSRC=40000) is routed to the audio
+        // receiver by Firefox's SSRC-first demux. RTCRtpScriptTransform on the audio
+        // receiver intercepts the raw H265 RTP regardless of video receiver codec.
+        await rtcClient.subscribe(user, mediaType);
+        log('[video] subscribed uid=' + user.uid + ' (H265 will arrive on audio receiver via ssrc:40000)');
         // Re-send askVersion after subscription — robot may need this as a trigger
         // to continue publishing. First send happens during RTM init (before user-published).
         // Second send here ensures robot gets it after we've confirmed it's in the channel.
