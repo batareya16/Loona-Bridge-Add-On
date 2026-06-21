@@ -740,6 +740,8 @@
             let h265ParamSets = [];  // Array<Uint8Array>: latest VPS/SPS/PPS NALs
             let h265FUBuf     = null; // Array<Uint8Array>: current FU fragments
             let h265FUType    = 0;   // nal_unit_type of FU being reassembled
+            let h265FULastSeq = 0;   // RTP seq# of last FU fragment (gap detection)
+            let h265FUSeqOk   = false; // true once any non-zero seq seen (confirms seq field available)
 
             // Build Annex B chunk: [params?][0001][NAL] and decode.
             // Track C (Node.js ffmpeg) is primary; VideoDecoder is fallback.
@@ -823,7 +825,7 @@
               // Per-receiver H264 reassembler (Broadway fallback)
               let fuBuf264 = null, fuNalLocal264 = 0, recvPktCount = 0;
 
-              function processPayload(payload, ts) {
+              function processPayload(payload, ts, seq) {
                 recvPktCount++;
                 totalPktCount++;
                 const pktNum = totalPktCount;
@@ -884,11 +886,27 @@
                   const isIDR    = (fuType === 19 || fuType === 20); // IDR_W_RADL / IDR_N_LP
                   if (isIDR && startBit) bwHasIDR = true;
 
+                  // Latch once we confirm sequenceNumber is non-zero (field is available).
+                  if (seq > 0) h265FUSeqOk = true;
+
                   if (startBit) {
                     h265FUType = fuType;
+                    h265FULastSeq = seq;
                     const nalHdr0 = (payHdr0 & 0x81) | (fuType << 1);
                     h265FUBuf = [new Uint8Array([nalHdr0, payHdr1]), payload.slice(3)];
                   } else if (h265FUBuf) {
+                    if (h265FUSeqOk) {
+                      const expectedSeq = (h265FULastSeq + 1) & 0xffff;
+                      if (seq !== expectedSeq) {
+                        // Middle RTP packet(s) lost — assembled NAL would be corrupt → grey frame.
+                        // Discard the partial FU; decoder will wait for next IDR.
+                        if (pktNum <= 20 || pktNum % 200 === 0)
+                          log('[h265] FU gap seq=' + seq + ' exp=' + expectedSeq + ' fuType=' + h265FUType + ' — drop');
+                        h265FUBuf = null;
+                        return;
+                      }
+                    }
+                    h265FULastSeq = seq;
                     h265FUBuf.push(payload.slice(3));
                   }
 
@@ -961,15 +979,15 @@
                 try {
                   const worker = new Worker(workerUrl);
                   worker.onmessage = (e) => {
-                    const { data, ft, ts } = e.data;
+                    const { data, ft, ts, seq } = e.data;
                     if (totalPktCount < 10) {
                       const hex = Array.from(data.slice(0, 8))
                         .map(b => b.toString(16).padStart(2, '0')).join(' ');
                       log('[h265] recv#' + idx + ' len=' + data.length +
                           ' nt5=' + (data.length ? (data[0]>>1)&0x3f : '?') +
-                          ' type=' + ft + ' [' + hex + ']');
+                          ' type=' + ft + ' seq=' + seq + ' [' + hex + ']');
                     }
-                    processPayload(data, ts);
+                    processPayload(data, ts, seq);
                   };
                   worker.onerror = (e) => log('[h265] recv#' + idx + ' worker err: ' + e.message);
                   recv.transform = new RTCRtpScriptTransform(worker);
