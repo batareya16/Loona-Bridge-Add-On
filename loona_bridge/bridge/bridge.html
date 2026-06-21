@@ -558,15 +558,12 @@
       // mode, so we go live+host too.
       const rtcMode  = cfg.rtc_mode || 'live';
       const rtcRole  = cfg.role     || 'host';
-      // Default to 'h265': Loona robot sends H265 (HEVC) video via Agora.
-      // With codec='h265' and Firefox 130+ (media.peerconnection.video.h265_enabled=true),
-      // Agora negotiates H265 in the video SDP → robot routes H265 to video receiver →
-      // Firefox decodes natively via GStreamer avdec_h265 → canvas capture via tick().
-      // Hardcoded 'h265': Loona robot always sends H265/HEVC.
-      // cfg.codec is set to 'h264' by the Python bridge but must be ignored here —
-      // telling Agora to negotiate H265 causes the edge server to route the robot's
-      // H265 stream to the video m-section where Firefox 130+GStreamer can decode it.
-      const rtcCodec = 'h265';
+      // Use 'h264': tells Agora edge to transcode the robot's H265 → H264 for delivery.
+      // With codec='h265' the edge passes H265 through unchanged; since Firefox's SDP
+      // has no H265 entry, the edge refuses to forward (no subscriber for H265) and
+      // inbound-rtp stays zero forever.  With codec='h264' the edge transcodes and
+      // delivers H264 which Firefox/Broadway can decode normally.
+      const rtcCodec = 'h264';
       const rtcClient = AgoraRTC.createClient({mode: rtcMode, codec: rtcCodec, role: rtcRole});
       log('[rtc-codec] using codec=' + rtcCodec + ' mode=' + rtcMode + ' role=' + rtcRole);
 
@@ -1052,12 +1049,10 @@
         if (mediaType !== 'video') return;
         // Subscribe to video — required for Agora edge to forward any RTP packets.
         // Without subscribe(), edge silently delivers nothing (bytes=0 forever).
-        // VP8/VP9 on the video receiver is OK: fixSsrc40000 injects a=ssrc:40000 into
-        // the AUDIO m-section, so robot's H265 (SSRC=40000) is routed to the audio
-        // receiver by Firefox's SSRC-first demux. RTCRtpScriptTransform on the audio
-        // receiver intercepts the raw H265 RTP regardless of video receiver codec.
+        // With rtcCodec='h264', Agora transcodes the robot's H265→H264 and delivers
+        // H264 on the VIDEO receiver.  Firefox renders it natively; tick() grabs frames.
         await rtcClient.subscribe(user, mediaType);
-        log('[video] subscribed uid=' + user.uid + ' (H265 will arrive on audio receiver via ssrc:40000)');
+        log('[video] subscribed uid=' + user.uid + ' (Agora will transcode H265→H264 for video receiver)');
         // Re-send askVersion after subscription — robot may need this as a trigger
         // to continue publishing. First send happens during RTM init (before user-published).
         // Second send here ensures robot gets it after we've confirmed it's in the channel.
