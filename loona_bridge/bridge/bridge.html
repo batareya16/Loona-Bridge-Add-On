@@ -805,7 +805,7 @@
               '        if (nt===28 && u8.length>1 && (u8[1]&0x80) && (u8[1]&0x1f)===5) ft="IDR";',
               '        if (nt5===48) ft="IDR";',
               '        if (nt5===49 && u8.length>2 && (u8[2]&0x80) && ((u8[2]&0x1f)===19||(u8[2]&0x1f)===20)) ft="IDR";',
-              '        self.postMessage({ data: u8, ts: chunk.timestamp||0, seq: m.sequenceNumber||0, ft: ft }, [u8.buffer]);',
+              '        self.postMessage({ data: u8, ts: chunk.timestamp||0, seq: (m.sequenceNumber||0) & 0xffff, ft: ft }, [u8.buffer]);',
               '      } catch(_) {}',
               '      ctrl.enqueue(chunk);',
               '    }',
