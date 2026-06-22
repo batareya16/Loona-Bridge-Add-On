@@ -148,11 +148,13 @@
         const ssrcLines = lines.filter(l => /^a=ssrc:40000\b/.test(l));
         if (ssrcLines.length > 0) {
           ssrcLines.forEach(l => console.log('[sdp-ssrc] found: ' + l));
+          window._ssrcSynthetic = false;
         } else {
           // No a=ssrc:40000 in offer — synthesize one.
           // Without an explicit ssrc binding Firefox won't demux SSRC=40000 to any
           // receiver and the track stays muted (totalPkt=0 forever).
           console.log('[sdp-ssrc] no a=ssrc:40000 in remote offer — will inject synthetic into audio');
+          window._ssrcSynthetic = true;
         }
         // Use found lines, or a synthetic cname entry when none are present.
         const toInject = ssrcLines.length > 0
@@ -1051,6 +1053,7 @@
         // Without subscribe(), edge silently delivers nothing (bytes=0 forever).
         // With rtcCodec='h264', Agora transcodes the robot's H265→H264 and delivers
         // H264 on the VIDEO receiver.  Firefox renders it natively; tick() grabs frames.
+        window._lastRtcVideoUser = user;
         await rtcClient.subscribe(user, mediaType);
         log('[video] subscribed uid=' + user.uid + ' (Agora will transcode H265→H264 for video receiver)');
         // Re-send askVersion after subscription — robot may need this as a trigger
@@ -1337,6 +1340,22 @@
             if (cmd === 100900 && subcmd === 400) {
               robotInControlMode = true;
               log('[rtm] ✓ Robot entered control mode (sub=400) — should start publishing');
+              // If SSRC=40000 wasn't in the initial SDP offer (synthetic injection),
+              // the robot wasn't publishing H265 yet at negotiation time — pkt stays 0.
+              // Force video resubscribe after 5 s: Agora renegotiates and the new offer
+              // will include SSRC=40000 (robot is now active). Skipped if pkt already
+              // arrived (synthetic injection worked or real SSRC appeared in later renegotiation).
+              if (window._ssrcSynthetic && window._lastRtcVideoUser) {
+                setTimeout(async () => {
+                  if (!window._ssrcSynthetic) return;  // real SSRC arrived in meanwhile
+                  try {
+                    log('[rtm] synthetic SSRC + sub=400 — resubscribing video for fresh SDP with SSRC=40000');
+                    await rtcClient.unsubscribe(window._lastRtcVideoUser, 'video');
+                    await rtcClient.subscribe(window._lastRtcVideoUser, 'video');
+                    window._ssrcSynthetic = false;
+                  } catch(e) { log('[!] video resubscribe failed: ' + e.message); }
+                }, 5000);
+              }
             }
             // sub=50000 = robot just finished standing up (was lying when wakeiot fired).
             // Enter-control-mode sent earlier was ignored because robot wasn't ready yet.

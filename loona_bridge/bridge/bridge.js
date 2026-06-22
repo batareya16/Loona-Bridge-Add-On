@@ -343,9 +343,15 @@ function findSdkFile(pkgName, candidates) {
   let ffH265            = null;
   let ffBuf             = Buffer.alloc(0);
   // hevc_v4l2m2m: rpivid driver present in HA OS on RPi4 (/dev/video19).
-  // Try hw first on ARM64; fall back to software only on non-zero exit code (real error).
+  // Try hw first on ARM64 only if the GStreamer element is actually installed.
   // Signal-kills (code=null, from our own kill()) are NOT hw failures — don't disable hw.
-  let useHwDec          = (process.arch === 'arm64');
+  const _hwElemAvail = (process.arch === 'arm64') && (() => {
+    try { return cp.spawnSync('gst-inspect-1.0', ['--exists', 'v4l2h265dec'], { timeout: 3000 }).status === 0; }
+    catch(_) { return false; }
+  })();
+  if (process.arch === 'arm64' && !_hwElemAvail)
+    console.error('[gst] v4l2h265dec not found — using software decode from start');
+  let useHwDec          = _hwElemAvail;
   let ffNoOutputTimer   = null;
   let ffFirstFrameSeen  = false;  // true after first JPEG output from current decoder instance
   // During pipeline startup (NULL→PLAYING) fdsrc does not read stdin.
@@ -368,7 +374,9 @@ function findSdkFile(pkgName, candidates) {
   // If the decoder falls behind, drop incoming frames rather than letting the
   // stdin buffer grow — this caps latency at MAX_PENDING_FRAMES × frame_interval.
   let ffPendingFrames   = 0;
-  const MAX_PENDING_FRAMES = 3;   // ≈300 ms at 10 fps; drop incoming when exceeded
+  // Software decode (avdec_h265) needs larger queue: H265 B-frame reorder buffer
+  // requires >3 frames in stdin before it starts outputting. With hw decode 3 is fine.
+  const MAX_PENDING_FRAMES = useHwDec ? 3 : 10;
 
   // First frame can take up to 12 s on Pi (GStreamer NULL→PLAYING + avdec_h265 init).
   // After the first frame, 3 s silence = decode error → kill + wait for IDR.
@@ -376,7 +384,8 @@ function findSdkFile(pkgName, candidates) {
     clearTimeout(ffNoOutputTimer);
     // First-frame timeout: 12 s (GStreamer NULL→PLAYING on Pi ≈ 2-4 s + avdec_h265 init).
     // Mid-stream stall timeout: 3 s (decoder should be outputting steadily by then).
-    const ms = ffFirstFrameSeen ? 3000 : 12000;
+    // Software decode is slower — give 8 s between frames before killing.
+    const ms = ffFirstFrameSeen ? (useHwDec ? 3000 : 8000) : 12000;
     ffNoOutputTimer = setTimeout(() => {
       if (ffH265) {
         console.error('[ffmpeg] no JPEG output for ' + (ms / 1000) +
