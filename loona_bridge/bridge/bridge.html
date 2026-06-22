@@ -1345,7 +1345,7 @@
             const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
             if (u8.length >= 4) cmd = dv.getInt32(0, true);
             if (u8.length >= 8) subcmd = dv.getInt32(4, true);
-            // cmd=404 = GAME_ERROR status; subcmd=40000=robot fell, subcmd=50000=robot stood up
+            // cmd=404 = motion-status event; subcmd=40000=robot fell, subcmd=50000=robot stood up
             // cmd=100900 + subcmd=500 = askVersion response (version data follows at byte 8+)
             const label = (cmd === 404) ? ('status/body=' + subcmd) :
                           (cmd === 100900 && subcmd === 500) ? 'askVersion-response' :
@@ -1355,6 +1355,18 @@
             if (cmd === 100900 && subcmd === 400) {
               robotInControlMode = true;
               log('[rtm] ✓ Robot entered control mode (sub=400) — should start publishing');
+            }
+            // sub=50000 = robot just finished standing up (was lying when wakeiot fired).
+            // Enter-control-mode sent earlier was ignored because robot wasn't ready yet.
+            // Retry now that it's upright and can receive RTM control commands.
+            if (cmd === 404 && subcmd === 50000 && !robotInControlMode) {
+              log('[rtm] robot stood up — retrying enter-control-mode in 1.5 s');
+              setTimeout(async () => {
+                try {
+                  if (window._rtmEnterControlMode) await window._rtmEnterControlMode();
+                  log('[rtm] enter-control-mode sent after robot stood up');
+                } catch(e) { log('[!] post-standup enter-control-mode failed: ' + e.message); }
+              }, 1500);
             }
             if (ws.readyState === 1) {
               try {
