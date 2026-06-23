@@ -999,10 +999,28 @@
                 });
               } catch(_) {}
               if (idrRetries % 3 === 0) {
-                if (window._rtmEnterControlMode) {
+                if (window._rtmEnterControlMode && !window._robotInControlMode) {
+                  // Only spam enter-control-mode while robot hasn't confirmed control mode yet.
+                  // Once sub=400 received, let the robot settle — repeated enter-control-mode
+                  // resets its publishing state and causes a deadlock.
                   window._rtmEnterControlMode().catch(() => {});
                   log('[h265] re-sent enter-control-mode via RTM (retry#' + idrRetries + ')');
                 }
+              }
+              // After 30 s in control mode with zero packets: force a fresh SDP via resubscribe.
+              // By this point TCP background reconnect (5 s→10 s→...) should have connected,
+              // CTRL_CONFIRM_LOCAL sent, and robot is trying to publish. Resubscribe forces a new
+              // SDP offer — if the robot is now actively publishing, SSRC=40000 will be in the offer
+              // and fixSsrc40000() will route it to the audio receiver.
+              if (idrRetries === 6 && totalPktCount === 0 &&
+                  window._robotInControlMode && window._lastRtcVideoUser && typeof rtcClient !== 'undefined') {
+                log('[h265] 30 s in control mode, still 0 packets — forcing video resubscribe');
+                robotInControlMode = false;
+                window._robotInControlMode = false;
+                rtcClient.unsubscribe(window._lastRtcVideoUser, 'video')
+                  .then(() => rtcClient.subscribe(window._lastRtcVideoUser, 'video'))
+                  .then(() => log('[h265] resubscribe after 30 s done'))
+                  .catch(e => log('[!] resubscribe failed: ' + e.message));
               }
               if (idrRetries >= 30) {
                 clearInterval(idrTimer);
@@ -1126,13 +1144,21 @@
             // The user-unpublished event will fire when robot truly stops, and will reset
             // broadwayActive=false so the next user-published does a full fresh reinit.
             if (muted === true) {
-              log('[video] trk.muted → re-sending full enter-control-mode sequence via RTM');
-              setTimeout(async () => {
-                try {
-                  if (window._rtmEnterControlMode) await window._rtmEnterControlMode();
-                  log('RTM enter-control-mode re-sent (muted)');
-                } catch(e) { log('[!] muted enter-control-mode failed: ' + e.message); }
-              }, 2000);
+              if (!window._robotInControlMode) {
+                // Haven't got sub=400 yet — prod the robot.
+                log('[video] trk.muted → re-sending enter-control-mode (not yet in control mode)');
+                setTimeout(async () => {
+                  try {
+                    if (window._rtmEnterControlMode) await window._rtmEnterControlMode();
+                    log('RTM enter-control-mode re-sent (muted)');
+                  } catch(e) { log('[!] muted enter-control-mode failed: ' + e.message); }
+                }, 2000);
+              } else {
+                // sub=400 already received — robot IS in control mode.
+                // Don't send enter-control-mode: it resets the robot's publishing state
+                // and causes a deadlock. The IDR timer will force a resubscribe at t=30 s.
+                log('[video] trk.muted — in control mode, waiting for robot to start publishing (IDR timer handles recovery)');
+              }
             }
           } else {
             log('[video-dbg] no <video> in container');
@@ -1339,6 +1365,7 @@
             // sub=400 = robot confirmed it entered control mode → it will publish
             if (cmd === 100900 && subcmd === 400) {
               robotInControlMode = true;
+              window._robotInControlMode = true;
               log('[rtm] ✓ Robot entered control mode (sub=400) — should start publishing');
               // If SSRC=40000 wasn't in the initial SDP offer (synthetic injection),
               // the robot wasn't publishing H265 yet at negotiation time — pkt stays 0.
@@ -1392,6 +1419,7 @@
         // sub=400 in robot→us = robot entered control mode (ack to our JOIN).
         // Track receipt so we stop retrying and know robot is publishing.
         let   robotInControlMode  = false;
+        window._robotInControlMode = false;  // accessible from h265 setup / watchdog scopes
 
         // Expose senders for re-use after subscription / muted retries.
         // Called from bridge.js (via page.evaluate) after each decoder kill/restart
