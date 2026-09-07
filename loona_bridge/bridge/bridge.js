@@ -297,6 +297,16 @@ function findSdkFile(pkgName, candidates) {
   console.error('[bridge] Firefox launched (persistent profile: ' + PROFILE_DIR + ')');
 
   const page = await context.newPage();
+  let shuttingDown = false;
+  const shutdown = async (reason) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error('[bridge] stopping: ' + reason);
+    try { if (ffH265) ffH265.kill('SIGTERM'); } catch (e) {}
+    try { await context.close(); } catch (e) {}
+    try { httpServer.close(); } catch (e) {}
+    process.exit(0);
+  };
 
   // ── Track C: H265 → JPEG via Node.js ffmpeg + direct Python WS ───────────────
   //
@@ -319,8 +329,11 @@ function findSdkFile(pkgName, candidates) {
   const pyWsUrl    = `ws://${cfg.ws_host || '127.0.0.1'}:${cfg.ws_port}`;
   let   pyWs       = null;
   let   pyWsReady  = false;
+  let   pyWsEverConnected = false;
+  let   pyWsExitTimer = null;
   let   firstJpeg  = true;
   const minIntervalMs = Math.floor(1000 / Math.max(1, cfg.fps || 10));
+  const PY_WS_MAX_BUFFERED = 512 * 1024;
   let   lastSendMs    = 0;
 
   function openPyWs() {
@@ -328,12 +341,23 @@ function findSdkFile(pkgName, candidates) {
     sock.on('open', () => {
       pyWs      = sock;
       pyWsReady = true;
+      pyWsEverConnected = true;
+      clearTimeout(pyWsExitTimer);
+      pyWsExitTimer = null;
       console.error('[pyWs] connected to Python at ' + pyWsUrl);
     });
     sock.on('close', () => {
       pyWs      = null;
       pyWsReady = false;
-      setTimeout(openPyWs, 3000);
+      if (!pyWsEverConnected) {
+        setTimeout(openPyWs, 3000);
+        return;
+      }
+      // A previously healthy Core WS closing means the camera session has been
+      // stopped. Exit Firefox instead of retaining its memory while run.sh waits
+      // for the next non-zero ws_port written by BridgeManager.
+      console.error('[pyWs] Python connection closed — stopping bridge in 15 s');
+      pyWsExitTimer = setTimeout(() => shutdown('Python WebSocket closed'), 15000);
     });
     sock.on('error', () => {});   // close event fires anyway
   }
@@ -342,6 +366,7 @@ function findSdkFile(pkgName, candidates) {
   // ── ffmpeg H265 decoder ────────────────────────────────────────────────────────
   let ffH265            = null;
   let ffBuf             = Buffer.alloc(0);
+  const MAX_JPEG_BUFFER = 4 * 1024 * 1024;
   // hevc_v4l2m2m: rpivid driver present in HA OS on RPi4 (/dev/video19).
   // Try hw first on ARM64 only if the GStreamer element is actually installed.
   // Signal-kills (code=null, from our own kill()) are NOT hw failures — don't disable hw.
@@ -504,7 +529,14 @@ function findSdkFile(pkgName, candidates) {
         for (let i = soi + 2; i + 1 < ffBuf.length; i++) {
           if (ffBuf[i] === 0xFF && ffBuf[i + 1] === 0xD9) { eoi = i; break; }
         }
-        if (eoi < 0) { if (soi > 0) ffBuf = ffBuf.slice(soi); break; }
+        if (eoi < 0) {
+          if (soi > 0) ffBuf = ffBuf.slice(soi);
+          if (ffBuf.length > MAX_JPEG_BUFFER) {
+            console.error('[gst] incomplete JPEG buffer exceeded 4 MiB — dropping it');
+            ffBuf = Buffer.alloc(0);
+          }
+          break;
+        }
         latestJpeg = ffBuf.slice(soi, eoi + 2);
         ffBuf      = ffBuf.slice(eoi + 2);
       }
@@ -529,7 +561,8 @@ function findSdkFile(pkgName, candidates) {
       if (now - lastSendMs < minIntervalMs) return;
       lastSendMs = now;
 
-      if (pyWsReady && pyWs.readyState === WS.OPEN) {
+      if (pyWsReady && pyWs.readyState === WS.OPEN &&
+          pyWs.bufferedAmount < PY_WS_MAX_BUFFERED) {
         pyWs.send(latestJpeg, { binary: true });
         if (firstJpeg) {
           firstJpeg = false;
@@ -759,12 +792,8 @@ function findSdkFile(pkgName, candidates) {
   });
   console.error('[bridge] page started, streaming...');
 
-  const shutdown = async () => {
-    try { await context.close(); } catch (e) {}
-    process.exit(0);
-  };
-  process.on('SIGINT',  shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT',  () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 
   await new Promise(() => {});
 })().catch((err) => {
