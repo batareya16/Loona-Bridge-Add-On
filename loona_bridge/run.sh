@@ -10,16 +10,24 @@ CONFIG_JSON="/ha_config/.loona/bridge-config.json"
 #
 # Priority:
 #   1. $HA_WS_HOST env var (explicit override — useful for development)
-#   2. ws_host from bridge-config.json IF it is a container IP (172.30.x.x)
-#      bridge_mgr.py discovers this via a UDP connect trick from inside Core.
-#      With host_network=true the bridge gateway 172.30.32.1 is the Pi's own
-#      interface — nothing listens there.  The container IP (e.g. .2) is the
-#      one reachable from the host network namespace.
+#   2. ws_host from bridge-config.json. bridge_mgr.py provides either Core's
+#      hassio-network IP or 127.0.0.1 when Core shares the host namespace.
+#      The Docker gateway 172.30.x.1 is never usable for this WebSocket.
 #   3. getent hosts homeassistant  (correct inside Docker, may give .1 on host)
 #   4. python3 socket.gethostbyname
 #   5. literal "homeassistant" (last-resort, let Firefox DNS try)
-is_usable_ha_host() {
+is_usable_config_host() {
   local h="$1"
+  # The add-on has host_network=true. When HA Core is host-networked too,
+  # 127.0.0.1 is the correct shared loopback address. The only known bad
+  # address is the hassio Docker gateway (.1), where Core does not listen.
+  [[ -n "$h" && ! "$h" =~ ^172\.30\..*\.1$ ]]
+}
+
+is_usable_discovered_host() {
+  local h="$1"
+  # DNS from a host-network add-on commonly resolves "homeassistant" to the
+  # Docker gateway. Do not use it when Core did not give us an explicit host.
   [[ -n "$h" && "$h" != "127.0.0.1" && ! "$h" =~ ^172\.30\..*\.1$ ]]
 }
 
@@ -35,19 +43,19 @@ resolve_ha_host() {
   if [[ -z "$h" && -f "$CONFIG_JSON" ]]; then
     cfg_host="$(jq -r '.ws_host // ""' "$CONFIG_JSON" 2>/dev/null)"
     # 172.30.x.1 is the Docker gateway, not the HA Core container.
-    if is_usable_ha_host "$cfg_host"; then
+    if is_usable_config_host "$cfg_host"; then
       h="$cfg_host"
     fi
   fi
   if [[ -z "$h" ]]; then
     candidate=$(getent hosts homeassistant 2>/dev/null | awk 'NR==1{print $1}')
-    if is_usable_ha_host "$candidate"; then
+    if is_usable_discovered_host "$candidate"; then
       h="$candidate"
     fi
   fi
   if [[ -z "$h" ]]; then
     candidate=$(python3 -c "import socket; print(socket.gethostbyname('homeassistant'))" 2>/dev/null || true)
-    if is_usable_ha_host "$candidate"; then
+    if is_usable_discovered_host "$candidate"; then
       h="$candidate"
     fi
   fi
