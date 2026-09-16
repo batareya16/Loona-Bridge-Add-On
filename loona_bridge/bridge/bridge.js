@@ -230,6 +230,7 @@ function findSdkFile(pkgName, candidates) {
 
   const context = await firefox.launchPersistentContext(PROFILE_DIR, {
     headless: true,
+    timeout: 45_000,
     env: launchEnv,
     // Provide a real viewport so Firefox doesn't treat the page as "background".
     // Without this, headless Firefox can suspend <video> elements and freeze

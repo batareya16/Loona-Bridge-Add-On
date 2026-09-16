@@ -19,12 +19,12 @@ CONFIG_JSON="/ha_config/.loona/bridge-config.json"
 #   4. python3 socket.gethostbyname
 #   5. literal "homeassistant" (last-resort, let Firefox DNS try)
 resolve_ha_host() {
-  local h
+  local h cfg_host
   h="${HA_WS_HOST:-}"
   if [[ -z "$h" && -f "$CONFIG_JSON" ]]; then
-    local cfg_host
     cfg_host="$(jq -r '.ws_host // ""' "$CONFIG_JSON" 2>/dev/null)"
-    if [[ "$cfg_host" =~ ^172\.30\. ]]; then
+    # 172.30.x.1 is the Docker gateway, not the HA Core container.
+    if [[ "$cfg_host" =~ ^172\.30\. && ! "$cfg_host" =~ \.1$ ]]; then
       h="$cfg_host"
     fi
   fi
@@ -53,14 +53,24 @@ read_options() {
   echo "$fps|$jpeg"
 }
 
+config_signature() {
+  [[ -f "$CONFIG_JSON" ]] || return 0
+  jq -r '[.ws_port // 0, .channel // "", .token // ""] | @tsv' "$CONFIG_JSON" 2>/dev/null
+}
+
 wait_for_ha_config() {
+  local previous_signature="${1:-}" signature
   while true; do
     if [[ -f "$CONFIG_JSON" ]]; then
       if jq -e '.ws_port != null and (.ws_port | tonumber) > 0' "$CONFIG_JSON" >/dev/null 2>&1; then
-        return 0
+        signature="$(config_signature)"
+        if [[ -z "$previous_signature" || "$signature" != "$previous_signature" ]]; then
+          BRIDGE_CONFIG_SIGNATURE="$signature"
+          return 0
+        fi
       fi
     fi
-    log "waiting for $CONFIG_JSON (Loona camera switch — BridgeManager must write ws_port) ..."
+    log "waiting for a new Loona camera session in $CONFIG_JSON ..."
     sleep 3
   done
 }
@@ -77,10 +87,11 @@ log "=== END DIAGNOSTIC ==="
 
 log "defaults from options: $(read_options)"
 
+last_config_signature=""
 while true; do
   # Always wait for a valid (ws_port > 0) config before starting bridge.js.
   # This handles both the initial start AND restarts after _teardown() sets ws_port=0.
-  wait_for_ha_config
+  wait_for_ha_config "$last_config_signature"
 
   if [[ ! -f "$CONFIG_JSON" ]]; then
     log "config disappeared after wait — retrying ..."
@@ -107,5 +118,6 @@ while true; do
   node /opt/loona-bridge/bridge.js
   code=$?
   set -e
-  log "bridge.js exited code=$code — waiting for camera switch ON ..."
+  last_config_signature="$BRIDGE_CONFIG_SIGNATURE"
+  log "bridge.js exited code=$code — waiting for a new camera session ..."
 done
