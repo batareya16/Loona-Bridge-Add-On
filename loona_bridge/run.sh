@@ -18,23 +18,39 @@ CONFIG_JSON="/ha_config/.loona/bridge-config.json"
 #   3. getent hosts homeassistant  (correct inside Docker, may give .1 on host)
 #   4. python3 socket.gethostbyname
 #   5. literal "homeassistant" (last-resort, let Firefox DNS try)
+is_usable_ha_host() {
+  local h="$1"
+  [[ -n "$h" && "$h" != "127.0.0.1" && ! "$h" =~ ^172\.30\..*\.1$ ]]
+}
+
 resolve_ha_host() {
-  local h cfg_host
+  local h cfg_host candidate
   h="${HA_WS_HOST:-}"
+  # An explicit override is intentionally trusted: it may name a non-Docker
+  # endpoint used by advanced installations.
+  if [[ -n "$h" ]]; then
+    echo "$h"
+    return 0
+  fi
   if [[ -z "$h" && -f "$CONFIG_JSON" ]]; then
     cfg_host="$(jq -r '.ws_host // ""' "$CONFIG_JSON" 2>/dev/null)"
     # 172.30.x.1 is the Docker gateway, not the HA Core container.
-    if [[ "$cfg_host" =~ ^172\.30\. && ! "$cfg_host" =~ \.1$ ]]; then
+    if is_usable_ha_host "$cfg_host"; then
       h="$cfg_host"
     fi
   fi
   if [[ -z "$h" ]]; then
-    h=$(getent hosts homeassistant 2>/dev/null | awk 'NR==1{print $1}')
+    candidate=$(getent hosts homeassistant 2>/dev/null | awk 'NR==1{print $1}')
+    if is_usable_ha_host "$candidate"; then
+      h="$candidate"
+    fi
   fi
   if [[ -z "$h" ]]; then
-    h=$(python3 -c "import socket; print(socket.gethostbyname('homeassistant'))" 2>/dev/null || true)
+    candidate=$(python3 -c "import socket; print(socket.gethostbyname('homeassistant'))" 2>/dev/null || true)
+    if is_usable_ha_host "$candidate"; then
+      h="$candidate"
+    fi
   fi
-  [[ -z "$h" ]] && h="homeassistant"
   echo "$h"
 }
 
@@ -101,6 +117,11 @@ while true; do
 
   # Resolve HA host AFTER config is available so we can read ws_host from it.
   RESOLVED_HOST="$(resolve_ha_host)"
+  if [[ -z "$RESOLVED_HOST" ]]; then
+    last_config_signature="$BRIDGE_CONFIG_SIGNATURE"
+    log "HA WS host is invalid or unavailable; refusing to launch Firefox. Waiting for a new camera session ..."
+    continue
+  fi
   log "HA WS host resolved: $RESOLVED_HOST"
 
   IFS='|' read -r FPS JPEG < <(read_options)
