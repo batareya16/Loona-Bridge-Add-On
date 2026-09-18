@@ -238,6 +238,7 @@ function findSdkFile(pkgName, candidates) {
   let   pyWs       = null;
   let   pyWsReady  = false;
   let   pyWsReconnectTimer = null;
+  let   pyWsRetryMs = 3000;
   let   firstJpeg  = true;
   const minIntervalMs = Math.floor(1000 / Math.max(1, cfg.fps || 10));
   const PY_WS_MAX_BUFFERED = 512 * 1024;
@@ -248,6 +249,7 @@ function findSdkFile(pkgName, candidates) {
     sock.on('open', () => {
       pyWs      = sock;
       pyWsReady = true;
+      pyWsRetryMs = 3000;
       clearTimeout(pyWsReconnectTimer);
       pyWsReconnectTimer = null;
       console.error('[pyWs] connected to Python at ' + pyWsUrl);
@@ -262,9 +264,11 @@ function findSdkFile(pkgName, candidates) {
       // control WS owns session liveness and will request a restart if its port
       // genuinely remains unavailable.
       if (!shuttingDown) {
-        console.error('[pyWs] Python connection closed — retrying in 3 s');
+        console.error('[pyWs] Python connection closed — retrying in ' +
+                      (pyWsRetryMs / 1000) + ' s');
         clearTimeout(pyWsReconnectTimer);
-        pyWsReconnectTimer = setTimeout(openPyWs, 3000);
+        pyWsReconnectTimer = setTimeout(openPyWs, pyWsRetryMs);
+        pyWsRetryMs = Math.min(pyWsRetryMs * 2, 30000);
       }
     });
     sock.on('error', () => {});   // close event fires anyway
