@@ -230,7 +230,7 @@ function findSdkFile(pkgName, candidates) {
 
   const context = await firefox.launchPersistentContext(PROFILE_DIR, {
     headless: true,
-    timeout: 45_000,
+    timeout: 120_000,
     env: launchEnv,
     // Provide a real viewport so Firefox doesn't treat the page as "background".
     // Without this, headless Firefox can suspend <video> elements and freeze
@@ -330,8 +330,7 @@ function findSdkFile(pkgName, candidates) {
   const pyWsUrl    = `ws://${cfg.ws_host || '127.0.0.1'}:${cfg.ws_port}`;
   let   pyWs       = null;
   let   pyWsReady  = false;
-  let   pyWsEverConnected = false;
-  let   pyWsExitTimer = null;
+  let   pyWsReconnectTimer = null;
   let   firstJpeg  = true;
   const minIntervalMs = Math.floor(1000 / Math.max(1, cfg.fps || 10));
   const PY_WS_MAX_BUFFERED = 512 * 1024;
@@ -342,23 +341,24 @@ function findSdkFile(pkgName, candidates) {
     sock.on('open', () => {
       pyWs      = sock;
       pyWsReady = true;
-      pyWsEverConnected = true;
-      clearTimeout(pyWsExitTimer);
-      pyWsExitTimer = null;
+      clearTimeout(pyWsReconnectTimer);
+      pyWsReconnectTimer = null;
       console.error('[pyWs] connected to Python at ' + pyWsUrl);
     });
     sock.on('close', () => {
-      pyWs      = null;
-      pyWsReady = false;
-      if (!pyWsEverConnected) {
-        setTimeout(openPyWs, 3000);
-        return;
+      if (pyWs === sock) {
+        pyWs      = null;
+        pyWsReady = false;
       }
-      // A previously healthy Core WS closing means the camera session has been
-      // stopped. Exit Firefox instead of retaining its memory while run.sh waits
-      // for the next non-zero ws_port written by BridgeManager.
-      console.error('[pyWs] Python connection closed — stopping bridge in 15 s');
-      pyWsExitTimer = setTimeout(() => shutdown('Python WebSocket closed'), 15000);
+      // This is a data-only channel. Core may replace it while a camera session
+      // is being created, so a single close must not kill Firefox. The page's
+      // control WS owns session liveness and will request a restart if its port
+      // genuinely remains unavailable.
+      if (!shuttingDown) {
+        console.error('[pyWs] Python connection closed — retrying in 3 s');
+        clearTimeout(pyWsReconnectTimer);
+        pyWsReconnectTimer = setTimeout(openPyWs, 3000);
+      }
     });
     sock.on('error', () => {});   // close event fires anyway
   }

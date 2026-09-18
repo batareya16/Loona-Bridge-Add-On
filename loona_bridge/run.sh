@@ -86,7 +86,15 @@ wait_for_ha_config() {
   local previous_signature="${1:-}" signature
   while true; do
     if [[ -f "$CONFIG_JSON" ]]; then
-      if jq -e '.ws_port != null and (.ws_port | tonumber) > 0' "$CONFIG_JSON" >/dev/null 2>&1; then
+      # Core writes a stub first, then fills Agora credentials after waking Loona.
+      # Starting Firefox from the stub races the persistent profile against the
+      # second write and creates a needless launch/restart cycle on ARM.
+      if jq -e '
+        .ws_port != null and (.ws_port | tonumber) > 0 and
+        (.app_id | strings | length > 0) and
+        (.channel | strings | length > 0) and
+        (.token | strings | length > 0)
+      ' "$CONFIG_JSON" >/dev/null 2>&1; then
         signature="$(config_signature)"
         if [[ -z "$previous_signature" || "$signature" != "$previous_signature" ]]; then
           BRIDGE_CONFIG_SIGNATURE="$signature"
@@ -113,7 +121,7 @@ log "defaults from options: $(read_options)"
 
 last_config_signature=""
 while true; do
-  # Always wait for a valid (ws_port > 0) config before starting bridge.js.
+  # Wait for full Agora credentials, not merely the early stub with a port.
   # This handles both the initial start AND restarts after _teardown() sets ws_port=0.
   wait_for_ha_config "$last_config_signature"
 
