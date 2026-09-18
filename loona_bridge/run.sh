@@ -3,46 +3,40 @@ set -euo pipefail
 
 OPTIONS_FILE="${OPTIONS_FILE:-/data/options.json}"
 CONFIG_JSON="/ha_config/.loona/bridge-config.json"
+bridge_pid=""
+bridge_session=0
 
-# resolve_ha_host: determine HA Core WebSocket address.
-# Called AFTER wait_for_ha_config so bridge-config.json exists and contains
-# the ws_host written by bridge_mgr.py (HA Core's actual container IP).
-#
-# Priority:
-#   1. $HA_WS_HOST env var (explicit override — useful for development)
-#   2. ws_host from bridge-config.json. bridge_mgr.py provides either Core's
-#      hassio-network IP or 127.0.0.1 when Core shares the host namespace.
-#      The Docker gateway 172.30.x.1 is never usable for this WebSocket.
-#   3. getent hosts homeassistant  (correct inside Docker, may give .1 on host)
-#   4. python3 socket.gethostbyname
-#   5. literal "homeassistant" (last-resort, let Firefox DNS try)
+stop_bridge_group() {
+  if [[ "$bridge_session" == "1" && -n "$bridge_pid" ]]; then
+    kill -TERM -- "-$bridge_pid" 2>/dev/null || true
+    sleep 2
+    kill -KILL -- "-$bridge_pid" 2>/dev/null || true
+  fi
+}
+
+# Stop Node and Firefox together on add-on restart.
+trap 'stop_bridge_group; exit 0' TERM INT
+
+# Never route the Core WebSocket through the hassio gateway.
 is_usable_config_host() {
   local h="$1"
-  # The add-on has host_network=true. When HA Core is host-networked too,
-  # 127.0.0.1 is the correct shared loopback address. The only known bad
-  # address is the hassio Docker gateway (.1), where Core does not listen.
   [[ -n "$h" && ! "$h" =~ ^172\.30\..*\.1$ ]]
 }
 
 is_usable_discovered_host() {
   local h="$1"
-  # DNS from a host-network add-on commonly resolves "homeassistant" to the
-  # Docker gateway. Do not use it when Core did not give us an explicit host.
   [[ -n "$h" && "$h" != "127.0.0.1" && ! "$h" =~ ^172\.30\..*\.1$ ]]
 }
 
 resolve_ha_host() {
   local h cfg_host candidate
   h="${HA_WS_HOST:-}"
-  # An explicit override is intentionally trusted: it may name a non-Docker
-  # endpoint used by advanced installations.
   if [[ -n "$h" ]]; then
     echo "$h"
     return 0
   fi
   if [[ -z "$h" && -f "$CONFIG_JSON" ]]; then
     cfg_host="$(jq -r '.ws_host // ""' "$CONFIG_JSON" 2>/dev/null)"
-    # 172.30.x.1 is the Docker gateway, not the HA Core container.
     if is_usable_config_host "$cfg_host"; then
       h="$cfg_host"
     fi
@@ -86,9 +80,7 @@ wait_for_ha_config() {
   local previous_signature="${1:-}" signature
   while true; do
     if [[ -f "$CONFIG_JSON" ]]; then
-      # Core writes a stub first, then fills Agora credentials after waking Loona.
-      # Starting Firefox from the stub races the persistent profile against the
-      # second write and creates a needless launch/restart cycle on ARM.
+      # Wait for the final config, not Core's initial stub.
       if jq -e '
         .ws_port != null and (.ws_port | tonumber) > 0 and
         (.app_id | strings | length > 0) and
@@ -121,8 +113,6 @@ log "defaults from options: $(read_options)"
 
 last_config_signature=""
 while true; do
-  # Wait for full Agora credentials, not merely the early stub with a port.
-  # This handles both the initial start AND restarts after _teardown() sets ws_port=0.
   wait_for_ha_config "$last_config_signature"
 
   if [[ ! -f "$CONFIG_JSON" ]]; then
@@ -131,7 +121,6 @@ while true; do
     continue
   fi
 
-  # Resolve HA host AFTER config is available so we can read ws_host from it.
   RESOLVED_HOST="$(resolve_ha_host)"
   if [[ -z "$RESOLVED_HOST" ]]; then
     last_config_signature="$BRIDGE_CONFIG_SIGNATURE"
@@ -150,10 +139,27 @@ while true; do
       "$CONFIG_JSON"
   )"
 
+  export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=256}"
   log "starting node bridge.js (ws_host=$RESOLVED_HOST) ..."
   set +e
-  node /opt/loona-bridge/bridge.js
+  # Keep Node and Firefox in one process group.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid node /opt/loona-bridge/bridge.js &
+    bridge_pid=$!
+    bridge_session=1
+  else
+    node /opt/loona-bridge/bridge.js &
+    bridge_pid=$!
+    bridge_session=0
+  fi
+  wait "$bridge_pid"
   code=$?
+  if [[ "$bridge_session" == "1" && "$code" -ne 0 ]]; then
+    log "bridge failed (code=$code); cleaning up its Firefox process group ..."
+    stop_bridge_group
+  fi
+  bridge_pid=""
+  bridge_session=0
   set -e
   last_config_signature="$BRIDGE_CONFIG_SIGNATURE"
   log "bridge.js exited code=$code — waiting for a new camera session ..."
